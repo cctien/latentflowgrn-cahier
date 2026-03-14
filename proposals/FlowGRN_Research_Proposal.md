@@ -1,4 +1,4 @@
-# FlowGRN: Latent Flow Matching for Gene Regulatory Network Inference
+# FlowGRN: Transferable Gene Regulatory Network Inference via Latent Flow Matching
 
 ## A Detailed Research Proposal
 
@@ -6,9 +6,13 @@
 
 ## 1. Architecture Design
 
-### 1.1 Background: The DeepSEM/DAZZLE Paradigm (Current SOTA on BEELINE)
+### 1.1 Background: Generative Models with Parameterized Adjacency for GRN Inference
 
-The current leading deep learning approach on BEELINE is based on the **Structural Equation Model (SEM)** framework, used by DeepSEM and its successor DAZZLE. The key idea:
+A family of recent methods share a common architecture: embed a **learnable adjacency matrix A** inside a generative model, train the model on scRNA-seq data, and extract A as the inferred GRN. These methods differ in their choice of generative backbone.
+
+#### 1.1.1 DeepSEM / DAZZLE (VAE backbone)
+
+The **Structural Equation Model (SEM)** framework uses a VAE where A appears in both encoder and decoder:
 
 **Linear SEM assumption:**
 
@@ -27,25 +31,45 @@ Rearranging into a VAE:
 - **Encoder:** `Z = X(I − Aᵀ)` — the GRN layer
 - **Decoder:** `X = Z(I − Aᵀ)⁻¹` — the inverse GRN layer
 
-The adjacency matrix `A` is a **learnable parameter**, jointly optimized with the encoder/decoder networks. The loss function is:
+The loss function is:
 
 ```
 L = -E_{z~q(Z|X)}[log p(X|Z)] + β·D_KL(q(Z|X) || p(Z)) + α·‖A‖₁
 ```
 
-The L1 penalty on A encourages sparsity (real GRNs are sparse).
+**Limitations:** (1) Training instability — networks degrade past convergence due to overfitting dropout noise; (2) Matrix inversion `(I − Aᵀ)⁻¹` is numerically unstable and O(g³) in runtime; (3) Static reconstruction only; (4) Directionality lost through |A| averaging over runs.
 
-**Key limitations of this approach:**
+#### 1.1.2 RegDiffusion (DDPM backbone)
 
-1. **Training instability:** DeepSEM's inferred networks degrade as training continues past convergence, likely due to overfitting dropout noise
-2. **Matrix inversion:** The `(I − Aᵀ)⁻¹` operation is numerically unstable and computationally expensive
-3. **Static reconstruction:** The model reconstructs static snapshots; it doesn't model the _dynamics_ that generate gene expression
-4. **Undirected edges in practice:** While A is asymmetric in principle, the model averages |A| over runs, partially losing directionality
-5. **No knowledge sharing:** Every dataset is trained from scratch — no transfer of regulatory logic across cell types, tissues, or species
+RegDiffusion (Zhu & Slonim, 2024) replaced the VAE with a **denoising diffusion probabilistic model (DDPM)**, achieving strong results:
+
+- **Forward process:** Add Gaussian noise to gene expression data following a diffusion schedule over T steps
+- **Reverse process:** A neural network with parameterized adjacency matrix A predicts the added noise
+- **Architecture:** Gene expression is embedded, then processed through 3 MLP training blocks. In each block, gene features are mixed with time step embeddings and cell type features. A is integrated as a learnable mixing matrix
+- **GRN extraction:** Same as DeepSEM — read off |A\_{ij}| as edge scores
+
+**Key advances over DeepSEM/DAZZLE:**
+
+- Eliminates matrix inversion entirely → runtime drops from O(m³n) to O(m²)
+- Superior stability across runs (small std over 10 seeds)
+- Outperforms DeepSEM, DAZZLE, GENIE3, GRNBoost2 on most BEELINE datasets
+- Scales to 15,000+ genes in under 5 minutes on A100; 40,000+ genes in v0.2
+- Can integrate into SCENIC pipeline as a drop-in replacement for GENIE3/GRNBoost2
+
+**Remaining limitations (shared with all prior methods):**
+
+1. **No knowledge sharing:** Every dataset is trained from scratch — no transfer of regulatory logic across cell types, tissues, or species
+2. **No OT-structured transport:** DDPM uses standard Gaussian noise schedules; the noise-to-data mapping is not structured by optimal transport
+3. **No velocity field / dynamics:** Noise prediction doesn't yield a biologically interpretable velocity field — you can't ask "how fast is gene i changing and why?"
+4. **MLP-only architecture:** No explicit graph message-passing structure in the noise prediction network; adjacency A acts as a linear mixing matrix, not as attention weights in a GNN
+5. **|A| extraction only:** No Jacobian or integrated-gradient-based GRN extraction; directionality still limited
 
 ### 1.2 Proposed Architecture: FlowGRN
 
-We propose replacing the VAE generative backbone with **conditional flow matching (CFM)**, while preserving the core insight of embedding the GRN structure into the generative model. Critically, the latent-space formulation enables a natural decomposition into **shared** (transferable) and **dataset-specific** (GRN) components.
+We propose **FlowGRN**, which advances beyond both the VAE family (DeepSEM/DAZZLE) and the DDPM family (RegDiffusion) in two key ways:
+
+1. **OT-conditional flow matching** as the generative backbone — providing structured transport, a biologically interpretable velocity field, and training stability advantages over both VAE and DDPM
+2. **Shared-private decomposition** for cross-dataset transfer learning — the primary novel contribution, enabled by the latent-space flow matching formulation
 
 #### Overview
 
@@ -104,9 +128,9 @@ Alternatively, you could use a **pretrained encoder** from scGPT or Geneformer, 
 
 The encoder weights θ_enc are **shared across all datasets** in the multi-task / transfer setting. This forces the encoder to learn a universal gene expression → latent mapping, rather than one tuned to a single cell type.
 
-**B) GRN-Structured Velocity Field (Core Innovation)**
+**B) GRN-Structured Velocity Field (Core Architectural Difference vs RegDiffusion)**
 
-The velocity field `v_θ(z_t, t)` that drives the flow is parameterized as a **Graph Attention Network** operating over genes:
+Where RegDiffusion uses 3 MLP blocks with A as a linear mixing matrix, FlowGRN uses a **Graph Attention Network** where A modulates attention weights:
 
 For each gene i, at flow time t:
 
@@ -122,11 +146,11 @@ where:
 - `MLP_msg` transforms incoming "messages" from regulator genes
 - `MLP_self` captures gene-autonomous dynamics
 
-**Key insight:** The velocity at gene i depends on the states of other genes j, weighted by α*{ij}. The learned attention weights—specifically the adjacency biases A*{ij}—directly encode whether gene j regulates gene i. High |A\_{ij}| means gene j has strong regulatory influence on gene i's dynamics.
+**Why GAT over MLP:** In RegDiffusion, A linearly mixes gene features — each gene's representation is a weighted sum of all genes' features via A. This is a single-hop linear interaction. The GAT formulation allows: (a) nonlinear, state-dependent attention that varies with the current expression state, (b) multi-hop message passing via stacked GAT layers, and (c) natural decomposition into shared (MLP weights) and private (A) components for transfer learning.
 
 **C) Flow Matching Training (No Simulation Required)**
 
-Instead of the VAE's reconstruction + KL loss, we train with the **conditional flow matching (CFM) objective**:
+Instead of the VAE's reconstruction + KL loss (DeepSEM) or DDPM's noise prediction loss (RegDiffusion), we train with the **conditional flow matching (CFM) objective**:
 
 ```
 L_CFM = E_{t, x_0, x_1} ‖v_θ(x_t, t) - u_t(x_t | x_0, x_1)‖²
@@ -138,6 +162,8 @@ where:
 - `x_1 ~ p_data` (actual scRNA-seq expression vectors)
 - `x_t = (1-t)·x_0 + t·x_1` (linear interpolation, OT conditional path)
 - `u_t(x_t | x_0, x_1) = x_1 - x_0` (the target velocity for the linear path)
+
+**Why CFM over DDPM (RegDiffusion):** (a) Single-step velocity regression vs T-step noise prediction — simpler training; (b) OT minibatch coupling produces straighter, non-crossing flows with lower training variance; (c) The learned velocity field v_θ is directly interpretable as "how fast and in what direction is each gene changing?"; (d) Deterministic ODE integration at inference vs stochastic reverse diffusion — faster sampling.
 
 **D) Full Loss Function**
 
@@ -160,6 +186,11 @@ After training:
 3. sign(A\_{ij}) indicates activation (+) or repression (−)
 4. Rank all gene pairs by |A\_{ij}| to produce a ranked edge list for evaluation
 
+Additionally, FlowGRN enables **velocity-field-based GRN extraction** not possible with RegDiffusion or DeepSEM:
+
+- **Jacobian analysis:** J\_{ij}(x\*, t) = ∂v_i/∂x_j captures both direct A and indirect effects
+- **Integrated Gradients:** IG\_{ij} = ∫_0^1 (∂v_i/∂x_j)·(x_1^j - x_0^j) dt for attribution over the full flow
+
 ### 1.3 Variant: Latent Flow Matching
 
 For better noise handling, operate the flow in a compressed latent space:
@@ -179,9 +210,9 @@ For better noise handling, operate the flow in a compressed latent space:
 
 This is more scalable for genome-wide inference but adds complexity to GRN extraction.
 
-### 1.4 Extension: Transfer Learning via Shared-Private Decomposition
+### 1.4 Primary Innovation: Transfer Learning via Shared-Private Decomposition
 
-The latent-space formulation enables a natural decomposition of the model into **shared** (transferable) and **private** (dataset-specific) components. This is a key architectural innovation — current GRN methods (DeepSEM, DAZZLE, GENIE3, GRNBoost2) all train from scratch on each dataset independently, discarding any regulatory logic that could transfer.
+**This is the central contribution that no prior GRN method supports** — not DeepSEM, not DAZZLE, not RegDiffusion, not GENIE3, not GRNBoost2. All current methods train from scratch on each dataset independently.
 
 #### The Biological Rationale
 
@@ -201,6 +232,8 @@ FlowGRN's architecture naturally separates these:
 | Adjacency matrix A_k               | Which edges are active in cell type k            | **Private (per-dataset)** |
 | Dataset embedding e_k (optional)   | Cell-type-specific context                       | **Private (per-dataset)** |
 
+**Why RegDiffusion cannot do this:** RegDiffusion's MLP blocks use A as a linear mixing matrix interleaved with MLP layers. The MLP weights and A are not cleanly separable — the MLPs learn dataset-specific patterns entangled with the adjacency structure. In FlowGRN's GAT formulation, A only enters through the attention bias, making the separation between "how signals propagate" (shared MLPs) and "which edges exist" (private A_k) architecturally explicit.
+
 #### Transfer Variants
 
 **Variant T1: Joint Multi-Task Training (simplest)**
@@ -215,69 +248,58 @@ L_total = Σ_{k=1}^{K} L_CFM^{(k)}(θ_shared, A_k) + α·Σ_k ‖A_k‖₁
 - A_k — separate adjacency matrix per dataset, only trained on data from dataset k
 - Batches alternate or mix cells from different datasets
 
-This forces the shared components to learn universal regulatory dynamics, while each A_k specializes to its cell type.
-
 **Variant T2: Pretrain-then-Finetune**
 
 Two-stage training:
 
-Stage 1 (Pretrain): Train FlowGRN jointly on a large collection of datasets (e.g., 6 of 7 BEELINE datasets, or external atlas data). Learn θ_shared and {A_1, ..., A_6}.
+Stage 1 (Pretrain): Train FlowGRN jointly on a large collection of datasets → get θ_shared\*.
 
-Stage 2 (Finetune): For a new target dataset, freeze θ_shared and only train a new A_target from scratch (or from a warm initialization). This is **few-shot GRN inference** — you need far less data because the encoder and velocity dynamics are already learned.
-
-```
-Stage 1: min_{θ_shared, {A_k}} Σ_{k=1}^{K} L^{(k)}
-Stage 2: min_{A_target} L^{(target)}  with θ_shared frozen
-```
+Stage 2 (Finetune): For a new target dataset, freeze θ_shared\* and only train a new A_target from scratch. This is **few-shot GRN inference** — you need far less data because the regulatory dynamics are already learned.
 
 **Variant T3: Cross-Species Transfer**
 
 For organisms with well-established ortholog mappings (e.g., mouse ↔ human):
 
-1. Train on source species datasets (e.g., all 5 mouse BEELINE datasets: mDC, mESC, mHSC-E/GM/L)
-2. Map gene identities via ortholog table (well-established for mouse-human, ~16,000 one-to-one orthologs)
-3. Transfer: freeze θ_shared, train A_target on human datasets (hESC, hHEP)
-
-The latent space is key here — in raw gene expression space, mouse genes and human genes are different features entirely. But the shared encoder learns to map orthologous regulatory programs into similar latent regions, enabling the velocity field MLPs to apply cross-species.
+1. Train on source species datasets (e.g., all 5 mouse BEELINE datasets)
+2. Map gene identities via ortholog table (~16,000 one-to-one orthologs for mouse-human)
+3. Transfer: freeze θ_shared, train A_target on human datasets
+4. Warm-start option: A_human ← O · A_mouse · Oᵀ (project mouse GRN via ortholog matrix O)
 
 **Variant T4: Foundation Model Backbone**
 
 Use a frozen pretrained encoder from scGPT (33M cells) or Geneformer (30M cells):
 
-1. The foundation model's encoder already provides a universal latent space across cell types and species
+1. The foundation model already provides a universal latent space
 2. Only train the velocity field (shared MLPs + per-dataset A_k)
-3. The pretrained gene embeddings capture coexpression and regulatory structure from massive pretraining data
-
-This is the most parameter-efficient variant and directly leverages the investment in foundation model pretraining.
+3. Most parameter-efficient variant
 
 #### Optional: Dataset Conditioning
 
-For Variants T1 and T2, optionally condition the velocity field on a dataset identity:
+Condition the velocity field on a dataset identity:
 
 ```
 v_i(z_t, t, k) = Σ_j α_{ij}^k · MLP_msg(z_t^j, t, e_k) + MLP_self(z_t^i, t, e_k)
 ```
 
-where e_k ∈ ℝ^{d_e} is a learnable embedding for dataset k (analogous to a "cell-type token"). This lets the shared MLPs modulate their behavior slightly per dataset, beyond just the adjacency difference. At inference time for a new dataset, e_k can be:
-
-- Initialized as the mean of existing embeddings
-- Learned alongside A_target in the finetune stage
-- Derived from dataset-level statistics (mean expression, cell count, etc.)
+where e_k ∈ ℝ^{d_e} is a learnable embedding for dataset k. This lets the shared MLPs modulate their behavior slightly per dataset, beyond just the adjacency difference.
 
 ### 1.5 Architecture Comparison
 
-| Feature                | DeepSEM/DAZZLE           | GRNFormer                   | **FlowGRN (ours)**            | **FlowGRN + Transfer**           |
-| ---------------------- | ------------------------ | --------------------------- | ----------------------------- | -------------------------------- |
-| Generative model       | VAE                      | N/A (discriminative)        | Flow Matching                 | Flow Matching                    |
-| GRN parameterization   | Explicit A in enc/dec    | Graph transformer attention | Adjacency-biased GAT velocity | Same, per-dataset A_k            |
-| Training objective     | Reconstruction + KL      | Supervised (needs labels)   | CFM regression (unsupervised) | Multi-task CFM                   |
-| Handles dynamics       | No (static)              | No                          | Yes (velocity field)          | Yes                              |
-| Directionality         | Weak (averaged \|A\|)    | Via TF-anchored subgraphs   | Strong (directed velocity)    | Strong                           |
-| Dropout robustness     | DAZZLE: DA augmentation  | N/A                         | OT coupling                   | OT + more data via sharing       |
-| Cross-dataset transfer | None                     | None                        | None (single-task)            | **Yes** (shared dynamics)        |
-| Few-shot GRN           | Not possible             | Requires labels             | Not possible                  | **Yes** (freeze shared, train A) |
-| Cross-species          | Not possible             | Not possible                | Not possible                  | **Yes** (via ortholog mapping)   |
-| Scalability            | O(g²) for matrix inverse | O(g·k) per subgraph         | O(g·k) sparse attention       | Same + amortized pretraining     |
+| Feature                 | DeepSEM/DAZZLE        | **RegDiffusion** | GRNFormer                   | **FlowGRN (ours)**                   |
+| ----------------------- | --------------------- | ---------------- | --------------------------- | ------------------------------------ |
+| Generative backbone     | VAE                   | DDPM             | N/A (discriminative)        | OT-CFM                               |
+| GRN parameterization    | A in enc/dec          | A as MLP mixing  | Graph transformer attention | A as GAT attention bias              |
+| Training objective      | Reconstruction + KL   | Noise prediction | Supervised (needs labels)   | Velocity regression (unsupervised)   |
+| Matrix inversion        | Yes, O(g³)            | **No**           | No                          | **No**                               |
+| Dynamics / velocity     | No                    | No               | No                          | **Yes**                              |
+| OT-structured transport | No                    | No               | No                          | **Yes**                              |
+| Directionality          | Weak (averaged \|A\|) | Weak (\|A\|)     | Via TF subgraphs            | **Strong** (directed velocity field) |
+| GRN extraction methods  | \|A\| only            | \|A\| only       | Attention weights           | **\|A\| + Jacobian + IG**            |
+| Cross-dataset transfer  | None                  | None             | None                        | **Yes** (shared-private)             |
+| Few-shot GRN inference  | Not possible          | Not possible     | Requires labels             | **Yes** (freeze shared, train A)     |
+| Cross-species transfer  | Not possible          | Not possible     | Not possible                | **Yes** (ortholog mapping)           |
+| Scalability             | O(g³n)                | **O(g²)**        | O(g·k)                      | O(g·k) sparse attention              |
+| Runtime (15k genes)     | >4 hours              | **<5 min**       | N/A                         | Est. 5-15 min                        |
 
 ---
 
@@ -333,14 +355,13 @@ has the same gradients as L_FM with respect to θ.
 π* = argmin_{π ∈ Π(p_0, p_1)} ∫ ‖x_0 - x_1‖² dπ(x_0, x_1)
 ```
 
-In practice, the exact OT plan is intractable for large datasets. **Minibatch OT** approximates it:
+In practice, **minibatch OT** approximates it:
 
-1. Sample a minibatch of B noise samples {x*0^i}*{i=1}^B and B data samples {x*1^j}*{j=1}^B
+1. Sample a minibatch of B noise samples {x_0^i} and B data samples {x_1^j}
 2. Solve the assignment problem within the batch:
    ```
    σ* = argmin_{σ ∈ S_B} Σ_{i=1}^B ‖x_0^i - x_1^{σ(i)}‖²
    ```
-   (This is the Hungarian algorithm, O(B³), or Sinkhorn approximation)
 3. Form paired samples (x_0^i, x_1^{σ\*(i)})
 
 **The conditional paths for OT-CFM:**
@@ -350,7 +371,7 @@ x_t = (1 - t)·x_0 + t·x_1         (linear interpolation)
 u_t(x | x_0, x_1) = x_1 - x_0     (constant velocity along straight line)
 ```
 
-**Why this matters for GRN inference:** OT coupling produces straighter, non-crossing flows. Since gene expression distributions often have complex multimodal structure (different cell types), OT coupling ensures the velocity field captures biologically meaningful transitions (e.g., stem cell → differentiated cell) rather than arbitrary noise-to-data mappings.
+**Why this matters for GRN inference:** OT coupling produces straighter, non-crossing flows. Since gene expression distributions have complex multimodal structure (different cell types), OT coupling ensures the velocity field captures biologically meaningful transitions rather than arbitrary noise-to-data mappings. RegDiffusion's DDPM uses isotropic Gaussian noise schedules, which don't have this structure.
 
 ### 2.3 Applying CFM to GRN Inference
 
@@ -362,17 +383,9 @@ u_t(x | x_0, x_1) = x_1 - x_0     (constant velocity along straight line)
 
 **GRN-structured velocity field:**
 
-For a cell at state x_t at flow time t, the velocity for gene i is:
-
 ```
 v_θ,i(x_t, t) = Σ_{j ∈ N(i)} α_{ij}(x_t, t) · φ(x_t^j, t) + ψ(x_t^i, t)
 ```
-
-where:
-
-- N(i) is the neighborhood of gene i (all genes if dense, top-k if sparse)
-- α\_{ij} are attention weights incorporating the learnable adjacency A
-- φ, ψ are shared MLPs for message and self-update functions
 
 **Attention mechanism with adjacency bias:**
 
@@ -380,12 +393,6 @@ where:
 e_{ij} = LeakyReLU(a^T · [W_Q x_t^i ‖ W_K x_t^j ‖ γ(t)])
 α_{ij} = exp(e_{ij} + λ·A_{ij}) / Σ_k exp(e_{ik} + λ·A_{ik})
 ```
-
-where:
-
-- A ∈ ℝ^{g×g} is the learnable adjacency (initialized to zeros or from prior)
-- λ controls the strength of the adjacency prior vs data-driven attention
-- γ(t) is a sinusoidal time embedding
 
 **Full training loss (single-dataset):**
 
@@ -395,18 +402,18 @@ L = E_{t~U[0,1], (x_0,x_1)~π_OT} ‖v_θ(x_t, t) - (x_1 - x_0)‖² + α·‖A�
 
 where R(A) is an optional structural regularizer:
 
-- **Acyclicity (NOTEARS):** R(A) = tr(e^{A∘A}) - g (forces DAG structure)
-- **Degree constraint:** R(A) = Σ*i max(0, Σ_j |A*{ij}| - k) (limits in-degree to k)
-- **Prior incorporation:** R(A) = ‖A ∘ M‖\_F² where M is a mask from TF motif data (penalize edges inconsistent with known motif binding)
+- **Acyclicity (NOTEARS):** R(A) = tr(e^{A∘A}) - g
+- **Degree constraint:** R(A) = Σ*i max(0, Σ_j |A*{ij}| - k)
+- **Prior incorporation:** R(A) = ‖A ∘ M‖\_F² where M is a mask from TF motif data
 
 ### 2.4 Multi-Task Flow Matching for Transfer Learning
 
 #### Formulation
 
-Given K datasets {D_1, ..., D_K} (e.g., different BEELINE cell types), we decompose the model parameters into:
+Given K datasets {D_1, ..., D_K}, decompose parameters into:
 
 - θ_shared = {θ_enc, θ_MLP_msg, θ_MLP_self, W_Q, W_K, a, b_A, λ} — shared across datasets
-- θ_private = {A_1, ..., A_K, e_1, ..., e_K} — per-dataset adjacency matrices and optional embeddings
+- θ_private = {A_1, ..., A_K, e_1, ..., e_K} — per-dataset adjacency matrices and embeddings
 
 **Multi-task loss:**
 
@@ -420,90 +427,37 @@ where:
 L^{(k)} = E_{t, (x_0, x_1^{(k)})~π_OT^{(k)}} ‖v_{θ_shared}(x_t, t; A_k, e_k) - (x_1^{(k)} - x_0)‖²
 ```
 
-and w_k are per-dataset weights (e.g., proportional to dataset size, or uniform).
-
-The velocity field with dataset conditioning:
-
-```
-v_i(z_t, t; A_k, e_k) = Σ_j α_{ij}^{(k)} · MLP_msg([z_t^j; γ(t); e_k]) + MLP_self([z_t^i; γ(t); e_k])
-```
-
-where [;] denotes concatenation and α\_{ij}^{(k)} uses A_k in the attention computation.
-
-#### Gradient Flow Analysis
-
-The key mathematical property: gradients from L^{(k)} flow into θ_shared through the velocity field MLPs but are blocked from other datasets' adjacency matrices by construction. Specifically:
-
-```
-∂L^{(k)}/∂θ_shared ≠ 0     (shared weights learn from all datasets)
-∂L^{(k)}/∂A_k ≠ 0          (A_k learns from dataset k)
-∂L^{(k)}/∂A_j = 0, j ≠ k   (A_j is not updated by dataset k's loss)
-```
-
-This ensures each A_k reflects only the GRN of its corresponding cell type, while θ_shared captures cross-dataset regulatory patterns.
+**Gradient flow property:** Gradients from L^{(k)} flow into θ_shared (shared weights learn from all datasets) but are blocked from A_j for j ≠ k (each adjacency learns only from its own data).
 
 #### Transfer to New Datasets
-
-For a new dataset D_target not seen during pretraining:
 
 ```
 A_target* = argmin_{A_target} L^{(target)}(θ_shared*, A_target, e_target) + α·‖A_target‖₁
 ```
 
-where θ_shared\* is frozen from pretraining. The dataset embedding e_target is either:
-
-- Jointly optimized with A_target
-- Set to the mean of pretrained embeddings: e_target = (1/K)Σ_k e_k
-- Computed from a lightweight projection of dataset-level statistics
+where θ_shared\* is frozen from pretraining.
 
 #### Cross-Species Formulation
 
-For cross-species transfer (e.g., mouse → human), introduce an ortholog mapping matrix O ∈ {0,1}^{g*h × g_m} where O*{ij} = 1 if human gene i is orthologous to mouse gene j. Then:
-
-1. Shared encoder operates on species-independent latent features
-2. The gene-level indexing in the adjacency matrix is remapped via O
-3. Warm-start: A_human ← O · A_mouse · Oᵀ (project mouse GRN into human gene space)
-4. Finetune A_human on human data with θ_shared frozen
+Introduce ortholog mapping matrix O ∈ {0,1}^{g_h × g_m}. Warm-start: A_human ← O · A_mouse · Oᵀ. Finetune A_human on human data with θ_shared frozen.
 
 ### 2.5 GRN Extraction and Scoring
 
-After training, extract the GRN:
+**Method 1: Direct adjacency** — Edge score(j → i) = |A*{ij}|, sign = sign(A*{ij})
 
-**Method 1: Direct adjacency extraction**
+**Method 2: Jacobian analysis** — J\_{ij}(x*, t) = ∂v_i(x*, t)/∂x_j, averaged over t and representative cells. Captures both direct A and indirect effects from shared MLPs.
 
-- Edge score(j → i) = |A\_{ij}|
-- Edge sign(j → i) = sign(A\_{ij})
+**Method 3: Integrated Gradients** — IG\_{ij} = ∫_0^1 (∂v_i(x_t, t)/∂x_j)·(x_1^j - x_0^j) dt
 
-**Method 2: Jacobian analysis of velocity field**
-
-- For representative cells x\* (e.g., cluster centroids):
-  ```
-  J_{ij}(x*, t) = ∂v_i(x*, t) / ∂x_j
-  ```
-- Average over t and representative cells:
-  ```
-  GRN_{ij} = E_{t, x*} [|J_{ij}(x*, t)|]
-  ```
-- This captures both the direct adjacency AND the indirect effects learned by the MLPs
-
-**Method 3: Integrated Gradients**
-
-- Compute attribution of each gene j to the velocity of gene i over the full flow:
-  ```
-  IG_{ij} = ∫_0^1 ∂v_i(x_t, t)/∂x_j · (x_1^j - x_0^j) dt
-  ```
-
-**Transfer-specific extraction note:** In the multi-task setting, Methods 2 and 3 capture effects from both A_k (dataset-specific) and θ_shared (universal dynamics). This means the Jacobian-based GRN may actually be _more informative_ than the raw A_k, since it incorporates universal regulatory logic learned from all datasets.
+**Transfer-specific note:** In the multi-task setting, Methods 2 and 3 capture effects from both A_k (dataset-specific) and θ_shared (universal dynamics). The Jacobian-based GRN may be more informative than raw A_k, since it incorporates universal regulatory logic learned from all datasets.
 
 ### 2.6 Biological Interpretation of the Flow
 
-The trained velocity field has a natural biological interpretation:
-
 - **v_i(x, t) > 0:** Gene i is being upregulated at state x, flow time t
 - **α\_{ij} large:** Gene j strongly influences the rate of change of gene i → regulatory edge
-- **Flow trajectories:** Integrating v_θ from noise to data traces paths through gene expression space that correspond to cell state transitions
-- **Cell-type-specific GRNs:** Evaluate J\_{ij}(x*, t) at different cell-type centroids x* to get context-dependent regulatory networks
-- **Shared vs specific regulation:** Compare A_k across datasets — edges that appear in all A_k represent conserved regulation; edges unique to one A_k represent context-specific wiring
+- **Flow trajectories:** Integrating v_θ from noise to data traces cell state transitions
+- **Cell-type-specific GRNs:** Evaluate J\_{ij}(x\*, t) at different cluster centroids
+- **Shared vs specific regulation:** Compare A_k across datasets — edges in all A_k represent conserved regulation; edges unique to one A_k represent context-specific wiring
 
 ---
 
@@ -515,266 +469,108 @@ The trained velocity field has a natural biological interpretation:
 
 #### A) Synthetic Networks (6 datasets)
 
-Generated from toy networks using BoolODE (stochastic simulation):
-
-- **dyn-LI:** Linear trajectory
-- **dyn-CY:** Cyclic trajectory
-- **dyn-LL:** Long linear trajectory
-- **dyn-BF:** Bifurcating trajectory
-- **dyn-TF:** Trifurcating trajectory
-- **dyn-BFC:** Bifurcating converging trajectory
-
-Each has sub-datasets with 100, 200, 500, 2000, 5000 cells × 10 samples.
-
-**Ground truth:** The exact network used to generate the data (known perfectly).
+Generated from toy networks using BoolODE: dyn-LI (linear), dyn-CY (cyclic), dyn-LL (long linear), dyn-BF (bifurcating), dyn-TF (trifurcating), dyn-BFC (bifurcating converging). Each has sub-datasets with 100–5,000 cells × 10 samples.
 
 #### B) Curated Boolean Models (4 datasets)
 
-From literature-curated Boolean models:
-
-- **HSC:** Hematopoietic stem cell differentiation
-- **mCAD:** Mammalian cortical area development
-- **VSC:** Ventral spinal cord development
-- **GSD:** Gonadal sex determination
-
-Each has 2000 cells × 10 samples, plus variants with 50% and 70% dropout.
-
-**Ground truth:** The Boolean model structure.
+HSC (hematopoietic), mCAD (cortical), VSC (spinal cord), GSD (gonadal). Each 2,000 cells × 10 samples, plus 50% and 70% dropout variants.
 
 #### C) Experimental scRNA-seq (7 datasets)
 
-Real datasets:
+hESC, hHEP, mDC, mESC, mHSC-E, mHSC-GM, mHSC-L.
 
-- **hESC:** Human embryonic stem cells (GSE75748)
-- **hHEP:** Human hepatocytes (GSE81252)
-- **mDC:** Mouse dendritic cells (GSE48968)
-- **mESC:** Mouse embryonic stem cells (GSE98664)
-- **mHSC-E, mHSC-GM, mHSC-L:** Mouse hematopoietic stem cells, three lineages (GSE81682)
-
-**Ground truths (approximate):**
-
-1. **Non-specific ChIP-seq** networks (from ENCODE, broad TF binding)
-2. **STRING** protein-protein interaction database
-3. **Cell-type-specific ChIP-seq** (matched to cell type)
-4. **LOF/GOF** (Loss-of-function / Gain-of-function perturbation studies)
+**Ground truths:** Non-specific ChIP-seq, STRING, Cell-type-specific ChIP-seq, LOF/GOF.
 
 Gene sets: All significantly varying TFs + top 500 or 1000 most varying genes.
 
 ### 3.2 Evaluation Metrics
 
-Following BEELINE protocol:
-
-1. **AUPRC (Area Under Precision-Recall Curve):**
-   - Primary metric for imbalanced binary classification (GRNs are very sparse)
-   - Report as **AUPRC ratio** = AUPRC / baseline (where baseline = edge density of ground truth)
-
-2. **EPR (Early Precision Ratio):**
-   - Precision among the top K predicted edges, where K = number of edges in ground truth
-   - EPR ratio = EP / random EP
-   - Measures: "How good are your best predictions?"
-
-3. **AUROC (Area Under ROC Curve):**
-   - Secondary metric; less informative for sparse networks but commonly reported
+1. **AUPRC ratio** = AUPRC / baseline (primary, handles class imbalance)
+2. **EPR** (Early Precision Ratio) — precision among top K predicted edges
+3. **AUROC** (secondary)
 
 ### 3.3 Baselines to Compare Against
 
-**Tier 1: Direct competitors (deep learning, unsupervised, on BEELINE)**
+**Tier 1: Direct competitors (generative model with parameterized A, unsupervised)**
 
-- DeepSEM (Nature Computational Science, 2021)
-- DAZZLE (PLOS Computational Biology, 2025) — current SOTA on BEELINE for unsupervised DL
+- **RegDiffusion** (J. Comp. Biol., 2024) — DDPM backbone, current best unsupervised DL on BEELINE
+- DeepSEM (Nature Computational Science, 2021) — VAE backbone
+- DAZZLE (PLOS Computational Biology, 2025) — VAE + dropout augmentation
 - GRN-VAE (simplified DeepSEM)
 - HyperG-VAE (hypergraph VAE with SEM cell encoder)
 
 **Tier 2: Classical methods (still competitive)**
 
-- GENIE3 (Random Forest regression)
-- GRNBoost2 (Gradient Boosting, used in SCENIC)
-- PIDC (Partial Information Decomposition)
-- PPCOR (Partial Correlation)
+- GENIE3, GRNBoost2, PIDC, PPCOR
 
-**Tier 3: Recent SOTA (may not all use BEELINE)**
+**Tier 3: Recent SOTA**
 
-- GRNFormer (Graph Transformer, 2025-2026)
-- scKAN (Kolmogorov-Arnold Networks, 2025)
-- scRegNet (Foundation model + GNN, 2025)
-- GRANGER (Recurrent VAE with Granger causality, 2025)
+- GRNFormer, scKAN, scRegNet, GRANGER
 
 **Tier 4: Transfer-aware methods (for transfer experiments)**
 
-- GRNPT (Transformer with LLM embeddings, cross-cell-type generalization)
-- Meta-TGLink (Graph meta-learning, few-shot GRN, supervised)
-- scMTNI (Multi-task network inference across lineages)
-- LINGER (Lifelong learning with atlas-scale external bulk data)
+- GRNPT (LLM embeddings + Transformer, cross-cell-type)
+- Meta-TGLink (graph meta-learning, few-shot, supervised)
+- scMTNI (multi-task across lineages)
+- LINGER (lifelong learning with atlas-scale bulk data)
 
 ### 3.4 Experimental Protocol
 
-#### Experiment 1: BEELINE Benchmark — Single-Dataset (Primary)
+#### Experiment 1: BEELINE Benchmark — Single-Dataset
 
-**Setup:**
+Standard BEELINE evaluation. FlowGRN-Solo vs all Tier 1-3 baselines. 10 random seeds, report mean ± std.
 
-1. Use all three BEELINE dataset categories
-2. For experimental datasets: TFs + 500 genes AND TFs + 1000 genes
-3. Run FlowGRN with 10 random seeds (report mean ± std)
-4. Use identical preprocessing as BEELINE Docker containers
-
-**Hyperparameter search:**
-
-- Latent dimension d ∈ {32, 64, 128}
-- Sparsity penalty α ∈ {0.001, 0.01, 0.1}
-- Adjacency bias strength λ ∈ {0.1, 1.0, 10.0}
-- OT batch size B ∈ {64, 128, 256}
-- Number of GAT attention heads ∈ {1, 4, 8}
-- Flow integration steps at inference ∈ {10, 20, 50, 100}
-
-**Key comparisons:**
-
-- FlowGRN vs DAZZLE (same input, same evaluation) — is flow matching better than VAE?
-- FlowGRN with OT coupling vs without — does OT improve inference?
-- FlowGRN with DAG constraint vs without — does acyclicity help?
+**Key comparison:** FlowGRN-Solo vs RegDiffusion — isolates the effect of flow matching (OT-CFM) vs diffusion (DDPM) with matched adjacency-matrix extraction.
 
 #### Experiment 2: Ablation Studies
 
-- **Velocity field architecture:** GAT vs simple MLP vs Transformer
+- **Generative backbone:** OT-CFM vs DDPM (RegDiffusion-style) vs VAE (DeepSEM-style) — all with same GAT velocity/noise network, isolating only the training objective
 - **OT coupling:** None (independent) vs minibatch OT vs Sinkhorn-regularized OT
+- **Velocity field architecture:** GAT vs MLP (RegDiffusion-style) vs Transformer
 - **GRN extraction method:** Direct A vs Jacobian vs Integrated Gradients
 - **Latent vs gene space:** Flow matching in original gene space vs latent space
 - **Dropout robustness:** Performance on curated datasets with 0%, 50%, 70% dropout
 - **With/without dropout augmentation:** Can DA (from DAZZLE) further improve FlowGRN?
 
-#### Experiment 3: External Biological Validation (Critical for Impact)
+#### Experiment 3: External Biological Validation
 
-BEELINE ground truths are imperfect. Validate beyond BEELINE:
-
-**A) ChIP-seq validation (following GRNFormer and DeepSEM):**
-
-- Predict TF-target edges for specific TFs in specific cell types
-- Validate against matched ChIP-seq binding data from ENCODE
-- Report AUC and AUPR for each TF
-
-**B) Perturbation prediction (following SCENIC+ and CellOracle):**
-
-- Use inferred GRN to predict downstream effects of TF knockout
-- Compare predicted differentially expressed genes against actual perturbation data
-- Datasets: Perturb-seq (Dixit et al., 2016), CRISPRi screens
-
-**C) Cross-species transfer (optional, high novelty):**
-
-- Train on well-annotated species (e.g., mouse hematopoiesis)
-- Evaluate GRN accuracy on related but less-annotated species
-- Tests generalization of flow-based representations
+**A) ChIP-seq validation:** Predict TF-target edges, validate against ENCODE ChIP-seq.
+**B) Perturbation prediction:** Use GRN to predict TF knockout effects, compare against Perturb-seq/CRISPRi data.
 
 #### Experiment 4: Scalability Analysis
 
-- Runtime vs number of genes (100, 500, 1000, 5000, 10000)
-- Runtime vs number of cells (100, 500, 2000, 5000, 20000)
-- GPU memory usage
-- Compare against DeepSEM, DAZZLE, GENIE3, GRNBoost2
+Runtime and memory vs genes (100–10,000) and cells (100–20,000). Compare directly against RegDiffusion's reported timings.
 
-#### Experiment 5: Multi-Task Joint Training (Transfer — Within BEELINE)
-
-Test whether sharing regulatory dynamics across BEELINE datasets helps:
+#### Experiment 5: Multi-Task Joint Training (Transfer — Primary Contribution)
 
 **Setup:**
 
-- FlowGRN-Solo: Train independently on each of the 7 experimental datasets (baseline)
-- FlowGRN-Joint: Train on all 7 datasets simultaneously (shared θ, per-dataset A_k)
-- FlowGRN-Joint-Cond: Same as Joint but with dataset conditioning embeddings e_k
+- FlowGRN-Solo: Independent training per dataset (baseline, same as Experiment 1)
+- FlowGRN-Joint: All 7 datasets, shared θ, per-dataset A_k
+- FlowGRN-Joint-Cond: Same + dataset conditioning embeddings e_k
+- RegDiffusion-Solo: Independent RegDiffusion per dataset (transfer-unaware control)
 
-**Evaluation:**
-
-- Compare AUPRC, EPR, AUROC on each dataset: Joint vs Solo
-- Report per-dataset results (does transfer help hESC? hHEP? mDC? etc.)
-- Analyze which datasets benefit most from sharing — hypothesis: smaller datasets and datasets from the same organism/lineage benefit most
-
-**What to look for:**
-
-- If Joint > Solo on most datasets: shared regulatory grammar helps
-- If Joint > Solo only on small datasets: transfer is a data-efficiency story
-- If Joint < Solo on some datasets: negative transfer — the datasets are too different
-- If Joint-Cond > Joint: conditioning helps the shared MLPs specialize
+**Evaluation:** Per-dataset AUPRC, EPR, AUROC. Report which datasets benefit from sharing.
 
 #### Experiment 6: Few-Shot GRN Inference (Transfer — Data Efficiency)
 
-Test whether pretrained shared weights reduce the data requirement:
+**Leave-One-Out:** For each dataset k: pretrain on 6 others → freeze θ_shared → finetune only A_k.
 
-**Setup — Leave-One-Out:**
-For each dataset k ∈ {1, ..., 7}:
+**Data Titration:** Subsample to {100%, 50%, 20%, 10%, 5%} of cells. Compare: (a) FlowGRN-Solo from scratch, (b) FlowGRN-Transfer with pretrained θ_shared, (c) RegDiffusion from scratch.
 
-1. Pretrain FlowGRN on the other 6 datasets → get θ_shared\*
-2. Finetune only A_k on dataset k (θ_shared frozen)
-3. Compare against FlowGRN-Solo trained on dataset k from scratch
+**Expected result:** Transfer should help most in low-data regime. Crossing point (where transfer matches full-data solo) is the key result.
 
-**Setup — Data Titration:**
-For each dataset k:
+#### Experiment 7: Cross-Species Transfer (Mouse → Human)
 
-1. Subsample to {100%, 50%, 20%, 10%, 5%} of cells
-2. Compare: (a) Solo from scratch vs (b) Transfer with pretrained θ_shared\*
-3. Plot AUPRC vs number of cells for both conditions
-
-**Expected result:** Transfer should help most in the low-data regime. If pretrained FlowGRN with 10% of cells matches Solo with 100%, that is a strong result for rare cell types and understudied organisms.
-
-**Additional baseline:** Compare against Meta-TGLink (the recent few-shot GRN method) in matched conditions, noting that Meta-TGLink is supervised while FlowGRN is unsupervised.
-
-#### Experiment 7: Cross-Species Transfer (Transfer — Mouse → Human)
-
-The most ambitious transfer experiment:
-
-**Setup:**
-
-1. **Source:** Train FlowGRN jointly on all 5 mouse datasets (mDC, mESC, mHSC-E/GM/L) → θ_shared_mouse
-2. **Ortholog mapping:** Use Ensembl BioMart one-to-one orthologs (~16,000 genes) to map mouse gene IDs → human gene IDs
-3. **Target:** Transfer to human datasets (hESC, hHEP):
-   - Freeze θ_shared_mouse
-   - Initialize A_human = O · A_mouse_avg · Oᵀ (warm start from projected mouse GRN)
-   - Alternatively: initialize A_human = 0 (cold start)
-   - Finetune A_human on human data
-4. **Compare against:** FlowGRN-Solo on human data, GENIE3 on human data, LINGER (which uses external bulk data)
-
-**Control:** Also test the reverse direction (human → mouse) and same-species transfer (mouse subset → mouse held-out) to disentangle the effects of species barrier vs more pretraining data.
-
-**What to look for:**
-
-- Warm start (projected A) vs cold start (A=0): does the mouse GRN structure help?
-- Cross-species transfer vs same-species transfer: how much does the species barrier cost?
-- Which gene pairs transfer well? Hypothesis: TFs with conserved binding motifs (e.g., core pluripotency factors, hematopoietic TFs) should transfer best
+Train on 5 mouse datasets → transfer to human (hESC, hHEP) via ortholog mapping. Compare warm-start (projected A_mouse) vs cold-start (A=0) vs FlowGRN-Solo on human data vs RegDiffusion on human data.
 
 #### Experiment 8: Analysis of Shared vs Specific Regulation
 
-Beyond performance metrics, analyze _what_ the model learns:
-
-**A) Conserved edge analysis:**
-
-- After joint training, compare A_k across datasets
-- Edges with high |A\_{ij}| in all datasets → conserved regulatory interactions
-- Validate against known housekeeping regulatory interactions
-
-**B) Context-specific edge analysis:**
-
-- Edges with high |A\_{ij}| in one dataset but low in others → context-specific regulation
-- Validate against cell-type-specific ChIP-seq ground truths
-
-**C) Shared weight inspection:**
-
-- Analyze what the shared MLP_msg learns: does it capture general activation/repression dynamics?
-- Visualize attention patterns before and after the adjacency bias: how much does A_k modulate the universal attention?
-
-**D) Latent space structure:**
-
-- Visualize the shared latent space: do cells from different datasets form meaningful clusters?
-- Do cells undergoing similar biological processes (e.g., differentiation) cluster together across datasets?
+After joint training: (A) identify conserved edges (high |A\_{ij}| across all A_k), (B) identify context-specific edges, (C) visualize shared latent space, (D) inspect what shared MLPs learn.
 
 ### 3.5 Implementation Plan
 
-**Libraries:**
-
-- PyTorch for model implementation
-- TorchCFM (https://github.com/atong01/conditional-flow-matching) for flow matching
-- PyTorch Geometric for graph attention layers
-- Scanpy for scRNA-seq preprocessing
-- POT (Python Optimal Transport) for OT solvers
-- Ensembl BioMart API (pybiomart) for ortholog mapping
-
-**Hardware:** Single GPU (A100/H100), models should be trainable in minutes per dataset
+**Libraries:** PyTorch, TorchCFM, PyTorch Geometric, Scanpy, POT, pybiomart
 
 **Code structure:**
 
@@ -782,26 +578,25 @@ Beyond performance metrics, analyze _what_ the model learns:
 flowgrn/
 ├── models/
 │   ├── encoder.py              # Per-gene MLP encoder (shared weights)
-│   ├── velocity_field.py       # GAT-based velocity network (shared + A_k)
+│   ├── velocity_field.py       # GAT-based velocity network
 │   ├── flow_matching.py        # OT-CFM training loop
-│   ├── grn_extraction.py       # Adjacency / Jacobian / IG methods
-│   └── transfer.py             # Multi-task trainer, freeze/finetune logic
+│   ├── grn_extraction.py       # |A| / Jacobian / IG methods
+│   └── transfer.py             # Multi-task trainer, freeze/finetune
 ├── data/
 │   ├── beeline_loader.py       # BEELINE dataset interface
-│   ├── preprocessing.py        # log1p transform, gene selection
 │   ├── multitask_loader.py     # Interleaved batching across datasets
-│   └── ortholog_mapper.py      # Cross-species gene mapping via BioMart
+│   └── ortholog_mapper.py      # Cross-species gene mapping
 ├── evaluation/
 │   ├── metrics.py              # AUPRC, EPR, AUROC
-│   ├── beeline_eval.py         # Full BEELINE evaluation pipeline
 │   └── transfer_analysis.py    # Conserved vs specific edge analysis
 ├── baselines/
-│   └── run_baselines.sh        # Docker commands for BEELINE baselines
+│   ├── run_baselines.sh        # BEELINE Docker baselines
+│   └── run_regdiffusion.py     # RegDiffusion head-to-head comparison
 └── experiments/
     ├── exp1_benchmark.py       # Single-dataset BEELINE
-    ├── exp2_ablations.py       # Architecture ablations
+    ├── exp2_ablations.py       # Architecture ablations (incl. CFM vs DDPM)
     ├── exp3_bio_validation.py  # ChIP-seq, perturbation validation
-    ├── exp4_scalability.py     # Runtime and memory analysis
+    ├── exp4_scalability.py     # Runtime / memory (incl. vs RegDiffusion)
     ├── exp5_joint_training.py  # Multi-task within BEELINE
     ├── exp6_few_shot.py        # Leave-one-out, data titration
     ├── exp7_cross_species.py   # Mouse → human transfer
@@ -812,76 +607,72 @@ flowgrn/
 
 **What success looks like:**
 
-_Core FlowGRN:_
+_Flow matching backbone (secondary contribution):_
 
-- AUPRC ratio improvement of 5-15% over DAZZLE on BEELINE experimental datasets
-- Significantly more stable results across random seeds (lower variance)
-- Better performance on high-dropout curated datasets (50%, 70%)
-- Stronger directionality in predicted edges (verified by ChIP-seq directional validation)
-- Competitive or better runtime vs DeepSEM/DAZZLE
+- Competitive or better AUPRC vs RegDiffusion on BEELINE (not guaranteed to be large margin — RegDiffusion is already strong)
+- More stable training (lower variance across seeds)
+- Richer GRN extraction via Jacobian/IG methods
+- Biologically interpretable velocity field
 
-_Transfer extension:_
+_Transfer learning (primary contribution):_
 
 - Joint training matches or beats single-dataset training on majority of BEELINE datasets
-- Few-shot setting: pretrained FlowGRN with 20% data matches Solo with 100% data
-- Cross-species: mouse→human transfer outperforms training on human data alone when human data is limited
-- Biologically interpretable conserved vs context-specific regulatory edges
+- Few-shot: pretrained FlowGRN with 20% data matches RegDiffusion-Solo with 100% data
+- Cross-species transfer outperforms solo training when target data is limited
+- Biologically interpretable conserved vs context-specific edges
 
 **Risks and mitigations:**
 
-| Risk                                                                        | Mitigation                                                                                                                                                                                 |
-| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Flow matching doesn't outperform VAE on static snapshots                    | Add time-series BEELINE datasets (synthetic with temporal ordering); use pseudotime to define biological source→target distributions                                                       |
-| OT computation too expensive for large gene sets                            | Use Sinkhorn regularization with ε=0.1; reduce batch OT to top-k genes per batch                                                                                                           |
-| Adjacency matrix doesn't converge                                           | Initialize A from GENIE3 output (warm start); anneal sparsity penalty                                                                                                                      |
-| BEELINE improvements are marginal                                           | Focus story on biological validation (Exp 3) and transfer novelty (Exp 5-8); marginal BEELINE + strong transfer story is publishable                                                       |
-| Model is too complex for reviewers                                          | Provide clear ablations showing which components matter; release clean code                                                                                                                |
-| **Negative transfer in joint training**                                     | **Report honestly; include Solo baseline always. Analyze which dataset pairs help/hurt. Negative transfer is itself an interesting finding about regulatory conservation.**                |
-| **Cross-species transfer doesn't work**                                     | **Include same-species transfer as control to isolate the species barrier. Even if cross-species fails, within-species transfer (e.g., mouse cell types helping each other) may succeed.** |
-| **Gene overlap between BEELINE datasets is too low for meaningful sharing** | **Report the gene overlap statistics. Use the intersection gene set for transfer experiments. If overlap is small, focus on the TF-centric subnetwork where overlap is higher.**           |
-| **Shared latent space collapses**                                           | **Monitor latent space quality during training (UMAP, silhouette scores). Add a contrastive or reconstruction auxiliary loss if needed to maintain structure.**                            |
+| Risk                                                      | Mitigation                                                                                                                                                                                                                                                  |
+| --------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| FlowGRN-Solo doesn't clearly beat RegDiffusion on BEELINE | This is acceptable — the primary contribution is transfer, not single-dataset SOTA. Report honestly; competitive performance + transfer capability is the story.                                                                                            |
+| OT computation too expensive for large gene sets          | Sinkhorn regularization; sparse attention limiting to top-k neighbors                                                                                                                                                                                       |
+| Negative transfer in joint training                       | Report honestly with Solo baseline. Analyze which dataset pairs help/hurt — negative transfer findings are publishable.                                                                                                                                     |
+| Cross-species transfer doesn't work                       | Include same-species transfer as control. Even within-species transfer alone is novel.                                                                                                                                                                      |
+| Gene overlap across BEELINE datasets too low              | Focus on TF-centric subnetwork where overlap is higher. Report overlap statistics.                                                                                                                                                                          |
+| Shared latent space collapses                             | Monitor with UMAP/silhouette. Add contrastive auxiliary loss if needed.                                                                                                                                                                                     |
+| Reviewers question novelty given RegDiffusion             | Emphasize: (1) transfer is the primary contribution, no prior method does this; (2) CFM vs DDPM is a principled choice with velocity field interpretation; (3) GAT architecture enables clean shared-private decomposition that RegDiffusion's MLPs cannot. |
 
 ---
 
 ## 4. Novelty Claims and Related Work Positioning
 
-### What makes this different from existing work:
+### Contribution hierarchy (explicit):
 
-1. **vs TrajectoryNet/TIGON/CellOT:** These use OT/flow for _trajectory inference_ (cell dynamics), with GRN as a downstream byproduct extracted post-hoc. FlowGRN embeds the GRN _directly into the velocity field architecture_, making GRN inference the primary training objective.
+**Primary contribution: Transferable GRN inference.** No existing method — RegDiffusion, DeepSEM, DAZZLE, GENIE3, GRNBoost2, or any other — supports transfer of regulatory dynamics across datasets, cell types, or species. FlowGRN's shared-private decomposition enables this for the first time in an unsupervised generative framework.
 
-2. **vs CycleGRN:** Uses invariant flows but restricted to oscillatory/cell-cycle genes. FlowGRN is general-purpose and applies to any gene set and trajectory topology.
+**Secondary contribution: OT-conditional flow matching for GRN inference.** RegDiffusion demonstrated that diffusion-family models outperform VAEs for GRN inference. We advance this further with flow matching, which provides OT-structured transport, a biologically interpretable velocity field, and cleaner architectural separation for transfer learning.
 
-3. **vs DeepSEM/DAZZLE:** Replaces the VAE with flow matching, which provides: (a) no need for matrix inversion, (b) OT-based noise handling instead of heuristic dropout augmentation, (c) a velocity field with natural biological interpretation as gene expression dynamics. Additionally, the shared-private architecture enables transfer learning, which is impossible in the DeepSEM/DAZZLE framework.
+**Tertiary contribution: Velocity-field-based GRN extraction.** Jacobian and integrated gradient analysis of the learned velocity field provides richer, more directional, and more context-aware GRN scores than the |A| extraction used by all prior methods.
 
-4. **vs GRNFormer:** Supervised method requiring ground-truth labels for training. FlowGRN is fully unsupervised, requiring only expression data.
+### Detailed positioning:
 
-5. **vs scGPT/Geneformer for GRN:** Foundation models extract gene embeddings and use similarity for GRN inference (post-hoc). FlowGRN learns the GRN as an integral structural component of the generative model. However, FlowGRN can _use_ foundation model encoders as its shared encoder backbone (Variant T4).
+1. **vs RegDiffusion (most direct competitor):** RegDiffusion uses DDPM with parameterized A in MLP blocks. FlowGRN uses OT-CFM with A as GAT attention bias. The key difference is not just the generative backbone (flow matching vs diffusion) but the architectural separation: FlowGRN's GAT cleanly separates shared dynamics (MLP weights) from dataset-specific wiring (A_k), enabling transfer learning. RegDiffusion's entangled MLP-A architecture cannot support this decomposition. Additionally, FlowGRN provides velocity-field-based GRN extraction and OT-structured transport, neither available in RegDiffusion.
 
-6. **vs GRNPT:** GRNPT uses LLM text embeddings and supervised training for cross-cell-type generalization. FlowGRN achieves transfer via shared generative dynamics in an entirely unsupervised manner — no labels, no external text data.
+2. **vs DeepSEM/DAZZLE:** Both RegDiffusion and FlowGRN improve on the VAE backbone. FlowGRN additionally enables transfer learning, which neither DeepSEM/DAZZLE nor RegDiffusion support.
 
-7. **vs Meta-TGLink:** Meta-TGLink is a supervised meta-learning approach for few-shot GRN inference. FlowGRN achieves few-shot capability through pretrained generative dynamics rather than meta-learning, and does not require ground-truth labels during pretraining.
+3. **vs TrajectoryNet/TIGON/CellOT:** These use OT/flow for trajectory inference with GRN as downstream byproduct. FlowGRN embeds the GRN directly into the velocity field as the primary training objective.
 
-8. **vs scMTNI:** scMTNI shares information across cell types on a single lineage via multi-task regularization. FlowGRN shares through a generative model's learned dynamics, applies to any collection of datasets (not just lineages), and the shared components are explicitly interpretable (what does the velocity field learn universally?).
+4. **vs CycleGRN:** Restricted to oscillatory/cell-cycle genes. FlowGRN is general-purpose.
 
-9. **vs LINGER:** LINGER uses external bulk data via lifelong learning to improve single-cell GRN inference. FlowGRN transfers from other single-cell datasets, which is complementary — both external bulk data (LINGER's approach) and cross-dataset single-cell transfer (FlowGRN's approach) could be combined.
+5. **vs GRNFormer/scRegNet:** Supervised methods requiring ground-truth labels. FlowGRN is fully unsupervised.
 
-### Paper framing options:
+6. **vs GRNPT:** Uses LLM text embeddings and supervised training for cross-cell-type generalization. FlowGRN achieves transfer via shared generative dynamics, unsupervised, no external text data.
 
-**Option A — Full paper (Nature Methods / Genome Biology):**
-FlowGRN as a complete method: flow matching backbone + transfer learning. Experiments 1-8. The narrative arc: "Flow matching provides a better generative backbone for GRN inference, and its latent-space formulation uniquely enables cross-dataset transfer learning."
+7. **vs Meta-TGLink:** Supervised meta-learning for few-shot GRN. FlowGRN achieves few-shot via pretrained generative dynamics without labels during pretraining.
 
-**Option B — Two papers:**
+8. **vs scMTNI:** Shares information across cell types on a single lineage via multi-task regularization. FlowGRN applies to any collection of datasets, and shared components are explicitly interpretable.
 
-- Paper 1 (Methods): FlowGRN core (Experiments 1-4). Focus: flow matching for GRN inference.
-- Paper 2 (Analysis/Application): Transfer extension (Experiments 5-8). Focus: when and why does transfer help GRN inference? What regulatory logic is conserved?
+9. **vs LINGER:** Uses external bulk data via lifelong learning. FlowGRN transfers from other single-cell datasets — complementary approaches that could be combined.
 
-**Option C — Conference + journal:**
+10. **vs scGPT/Geneformer:** Foundation models extract gene embeddings for post-hoc GRN similarity inference. FlowGRN learns the GRN as a structural component of the generative model, but can use foundation model encoders as its backbone (Variant T4).
 
-- Conference (NeurIPS/ICML workshop or main): FlowGRN core with transfer as an ablation
-- Journal follow-up: Full biological analysis with cross-species transfer
+### Paper framing (revised for RegDiffusion context):
+
+**Recommended framing:** "Transferable GRN inference via latent flow matching." The narrative: "Recent work (RegDiffusion) showed that diffusion models outperform VAEs for GRN inference. We extend this line of inquiry with two contributions: (1) we advance the generative backbone from DDPM to OT-conditional flow matching, gaining interpretable velocity fields and OT-structured transport; (2) more importantly, we show that the latent flow matching formulation uniquely enables a shared-private decomposition for cross-dataset transfer learning — the first unsupervised GRN method to share regulatory dynamics across cell types and species."
 
 ### Target venues:
 
-- Nature Methods, Nature Computational Science, Genome Biology (full scope, Options A or B)
-- Bioinformatics, Briefings in Bioinformatics (core method only)
-- NeurIPS / ICML (machine learning angle with biological validation)
+- Nature Methods, Nature Computational Science, Genome Biology (full scope with transfer)
+- Bioinformatics, Briefings in Bioinformatics (method + transfer)
+- NeurIPS / ICML (ML angle: transferable generative models for biological networks)
