@@ -6,6 +6,44 @@
 
 ---
 
+## Codebases to Build On
+
+### RegDiffusion (primary skeleton)
+
+- **Repo:** `TuftsBCB/RegDiffusion` — `pip install regdiffusion`
+- **Use for:** BEELINE data loading (`rd.data.load_beeline`), evaluation (`GRNEvaluator` — AUPRC, EPR, AUROC with proper edge matching), adjacency matrix parameterization pattern, ground truth handling, local network visualization
+- **Study:** How `RegDiffusionTrainer` parameterizes A in MLP blocks, how `get_adj()` extracts the final adjacency, how sparsity is controlled (L1/L2 + regulation norm initialization), convergence detection
+- **Don't use:** Their DDPM training loop (we replace with CFM)
+
+### TorchCFM (flow matching engine)
+
+- **Repo:** `atong01/conditional-flow-matching` — `pip install torchcfm`
+- **Use for:** `ConditionalFlowMatcher` class, `ExactOptimalTransportConditionalFlowMatcher` for OT coupling, minibatch OT solver, time sampling
+- **Study:** How `sample_location_and_conditional_flow` works — it gives you x_t and the target velocity u_t in one call
+- **Don't use:** Their example models (we write our own GAT velocity field)
+
+### FlowGRN-Tong (specific components only)
+
+- **Repo:** `1250326/FlowGRN`
+- **Use for:** Dropout-robust d_raw formula (Eq. 4 in their paper — simple to reimplement), kNN graph + Dijkstra geodesic distance pattern
+- **Study:** Their [SF]²M training loop for reference, how they handle Slingshot pseudotime and lineage-aware trajectory reconstruction
+- **Don't use:** dynGENIE3 integration (R/CPU), Slingshot preprocessing (not needed for noise→data flow matching), their model architecture (plain MLP, no parameterized A)
+
+### PyTorch Geometric (GAT layers)
+
+- **Repo:** `pyg-team/pytorch_geometric` — `pip install torch-geometric`
+- **Use for:** `GATConv` or `GATv2Conv` as starting point for the attention layer, sparse graph operations
+- **Alternative:** Write a custom GAT layer (~50 lines) if you want full control over the attention bias mechanism — `A_{ij}` as additive bias in softmax is not standard in PyG's GATConv and may be easier to implement from scratch
+
+### What NOT to use
+
+- Any R packages (dynGENIE3, Slingshot R version)
+- DeepSEM's matrix inversion code
+- Any CPU-bound external GRN inference tools
+- Heavy preprocessing pipelines that add latency to the dev loop
+
+---
+
 ## Phase 1: Foundation (Get to first AUPRC number)
 
 ### 1a: Environment + RegDiffusion Baseline (~2 hours)
