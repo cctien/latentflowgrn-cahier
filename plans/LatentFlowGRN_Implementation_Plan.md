@@ -11,6 +11,7 @@
 ### RegDiffusion (primary skeleton)
 
 - **Repo:** `TuftsBCB/RegDiffusion` — `pip install regdiffusion`
+- **Locally:** `~/Documents/others_projects/RegDiffusion`
 - **Use for:** BEELINE data loading (`rd.data.load_beeline`), evaluation (`GRNEvaluator` — AUPRC, EPR, AUROC with proper edge matching), adjacency matrix parameterization pattern, ground truth handling, local network visualization
 - **Study:** How `RegDiffusionTrainer` parameterizes A in MLP blocks, how `get_adj()` extracts the final adjacency, how sparsity is controlled (L1/L2 + regulation norm initialization), convergence detection
 - **Don't use:** Their DDPM training loop (we replace with CFM)
@@ -25,6 +26,7 @@
 ### FlowGRN-Tong (specific components only)
 
 - **Repo:** `1250326/FlowGRN`
+- **Locally:** `~/Documents/others_projects/FlowGRN`
 - **Use for:** Dropout-robust d_raw formula (Eq. 4 in their paper — simple to reimplement), kNN graph + Dijkstra geodesic distance pattern
 - **Study:** Their [SF]²M training loop for reference, how they handle Slingshot pseudotime and lineage-aware trajectory reconstruction
 - **Don't use:** dynGENIE3 integration (R/CPU), Slingshot preprocessing (not needed for noise→data flow matching), their model architecture (plain MLP, no parameterized A)
