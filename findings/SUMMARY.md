@@ -215,6 +215,57 @@ network degenerates toward a linear SEM.
 | Co-expression bias doesn't help | Correlation != regulation | 006 |
 | Supervision on eval edges = leakage | AUROC=1.0 (trivially) | 004 |
 | L1 regularization is ineffective | ~0.00003 vs ~1.5 flow loss | 001 |
+| Joint training is neutral with HVG gene sets | Near-zero gene overlap | 008 |
+| Few-shot is stable (10% ≈ 100%) but below solo | Frozen blocks constrain | 008 |
+
+---
+
+## 5. Phase 4: Transfer Learning (Finding 008)
+
+### Architecture
+
+Weight sharing via module references: GAT blocks (attention, FFN, time
+projection) shared across all datasets; gene embeddings and A_k per-dataset.
+Different gene counts supported naturally since blocks operate on hidden dim D.
+
+### Joint training (5 mouse datasets)
+
+| Dataset | Solo AUROC | Joint AUROC | Delta |
+|---------|-----------|-------------|-------|
+| mDC | 0.556 | 0.544 | -0.011 |
+| mESC | 0.616 | **0.618** | +0.002 |
+| mHSC-E | 0.727 | 0.727 | 0.000 |
+| mHSC-GM | 0.764 | 0.759 | -0.005 |
+| mHSC-L | 0.698 | 0.691 | -0.006 |
+| **Mean** | **0.672** | **0.668** | **-0.004** |
+
+**Roughly neutral.** No dataset shows significant benefit or harm.
+
+### Few-shot titration (mESC, pretrained on 4 other datasets)
+
+| Cells | AUROC | vs Solo (0.616) |
+|-------|-------|-----------------|
+| 421 (100%) | 0.599 | -0.017 |
+| 210 (50%) | 0.599 | -0.017 |
+| 84 (20%) | 0.601 | -0.016 |
+| 42 (10%) | 0.602 | -0.015 |
+
+**Stable across fractions** — pretrained blocks prevent overfitting. But
+**absolute performance is 0.015 below solo** due to domain mismatch.
+
+### Root cause: gene overlap
+
+HVG selection picks different genes per dataset. Only 13 genes overlap
+across all 5 mouse datasets (out of 4223 union). The shared blocks learn
+generic hidden-state processing but can't transfer gene-specific regulatory
+knowledge. To see real transfer benefit, datasets need shared gene panels
+or ortholog-based mapping.
+
+---
+
+## 6. Technical Lessons
+
+(updated with Phase 4 entries at the end of the table above)
 
 ---
 
@@ -231,11 +282,17 @@ network degenerates toward a linear SEM.
 3. **Single seed** — results are from seed=42 only. Multi-seed runs needed
    for confidence intervals.
 
-4. **Phase 4 (transfer learning)** — training shared models across datasets
-   is the project's primary novel contribution, not yet implemented.
+4. **Transfer learning limited by gene overlap** — HVG selection creates
+   near-disjoint gene sets across datasets, preventing meaningful transfer
+   of regulatory structure. Fixed gene panels or ortholog mapping needed.
 
 5. **No latent space** — flow matching operates directly on expression vectors.
-   An encoder-decoder architecture could improve scaling and enable transfer.
+   An encoder-decoder architecture could improve scaling and enable transfer
+   by mapping variable gene sets into a shared latent space.
+
+6. **Few-shot underperforms solo** — frozen shared blocks from mismatched
+   datasets constrain the model more than they help. Partial unfreezing or
+   adapter layers could improve this.
 
 ---
 
@@ -253,3 +310,6 @@ network degenerates toward a linear SEM.
 | 2 | SEM sweep | `traces/mESC_1000_STRING_sem_*/` |
 | 2 | GRN coupling (low-rank) | `traces/mESC_1000_STRING_grncoup_*/` |
 | 3 | Full BEELINE benchmark | `traces/bench_*_*/` |
+| 4 | Joint training | `traces/transfer/20260315_010953_CDT/` |
+| 4 | Pretrain (4 datasets) | `traces/transfer/20260315_011825_CDT/` |
+| 4 | Few-shot titration | `traces/transfer/20260315_01*_CDT/` |

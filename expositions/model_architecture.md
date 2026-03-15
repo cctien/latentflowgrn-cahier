@@ -589,7 +589,94 @@ All coupling and regularization parameters with defaults:
 ```
 
 
-## 12. What the Model Does NOT Do
+## 12. Transfer Learning (Multi-Dataset Training)
+
+### Motivation
+
+The single-dataset model trains independently per dataset. Transfer learning
+shares the velocity field's learned "regulatory grammar" across datasets
+while keeping per-dataset gene embeddings and adjacency matrices.
+
+### What is shared vs per-dataset
+
+The key insight is that velocity blocks operate on hidden dimension D,
+independent of the number of genes G:
+
+```
+Shared (D-dependent, G-independent):
+  - time_mlp: time embedding
+  - blocks: GATBlock or VelocityBlock layers
+  - input_proj, final_norm, final: projections
+  - a_scale: attention bias scale
+
+Per-dataset (G-dependent):
+  - gene_emb: GeneEmbedding(G_k, D-1)  -- different genes per dataset
+  - adj: AdjacencyMatrix(G_k, G_k)      -- different regulatory network
+```
+
+### Implementation: weight sharing by reference
+
+Multiple model instances are created (one per dataset), then shared modules
+are assigned by Python reference:
+
+```python
+model_0 = GATVelocityField(n_genes_0, adj_0, ...)  # first dataset
+model_k = GATVelocityField(n_genes_k, adj_k, ...)  # other dataset
+
+# Share blocks -- same tensor objects, not copies
+model_k.time_mlp = model_0.time_mlp
+model_k.blocks = model_0.blocks
+model_k.input_proj = model_0.input_proj
+model_k.final_norm = model_0.final_norm
+model_k.final = model_0.final
+model_k.a_scale = model_0.a_scale
+```
+
+PyTorch deduplicates shared parameters in the optimizer automatically.
+Each dataset's A_k only receives gradients from its own flow loss.
+
+### Training loop
+
+```python
+for epoch in range(epochs):
+    for ds_name in dataset_names:           # round-robin
+        model = models[ds_name]
+        x1 = next(dataloaders[ds_name])     # dataset-specific batch
+        x0 = torch.randn_like(x1)
+        t, xt, ut = fm.sample(x0, x1)
+        vt = model(xt, t)                   # uses dataset's gene_emb + adj
+        loss = F.mse_loss(vt, ut)           # shared blocks get gradients
+        loss.backward()
+        optimizer.step()
+```
+
+### Modes
+
+- **joint**: all datasets train simultaneously
+- **pretrain**: train on K-1 datasets, save shared checkpoint
+- **finetune**: load shared checkpoint, freeze shared params, train only A
+  on target dataset (optionally with reduced cell count for few-shot)
+
+### Findings (Finding 008)
+
+Joint training was roughly neutral (mean AUROC -0.004 vs solo). Few-shot
+finetuning showed remarkable stability (10% cells = 100% cells) but
+absolute performance fell below solo training. The root cause is near-zero
+gene overlap across datasets when using HVG selection (see the gene panels
+exposition for details).
+
+### Configuration
+
+```python
+class TransferConfig(BaseModel):
+    datasets: list[DatasetEntry]           # list of datasets to train on
+    mode: Literal["joint", "pretrain", "finetune"] = "joint"
+    finetune_freeze_shared: bool = True    # freeze shared params in finetune
+    data_fraction: float = 1.0             # cell subsampling for titration
+```
+
+
+## 13. What the Model Does NOT Do
 
 - **No latent space**: the flow operates directly on gene expression vectors,
   not a learned latent representation. The `latent_dim` config field is unused.
@@ -599,5 +686,6 @@ All coupling and regularization parameters with defaults:
   emerges naturally from soft thresholding and training dynamics.
 - **No trajectory reconstruction**: the model only predicts velocity at
   sampled time points, not full cell trajectories.
-- **No transfer learning**: the current architecture trains on a single
-  dataset. Shared-private decomposition (Phase 4) is not implemented.
+- **No gene-level transfer**: gene embeddings are per-dataset. Genes present
+  in multiple datasets do not share embeddings. See the gene panels exposition
+  for how this could be addressed.
