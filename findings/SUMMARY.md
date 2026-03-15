@@ -1,4 +1,4 @@
-# LatentFlowGRN: Phase 1-3 Findings Summary
+# LatentFlowGRN: Findings Summary
 
 **Date:** 2026-03-15
 **Authors:** (project team)
@@ -263,13 +263,54 @@ or ortholog-based mapping.
 
 ---
 
-## 6. Technical Lessons
+## 6. Phase 5: GRNFormer-Inspired Improvements (Finding 009)
 
-(updated with Phase 4 entries at the end of the table above)
+Evaluated 6 ideas from GRNFormer (a supervised graph transformer for GRN
+inference) adapted to our unsupervised framework. All tested on
+mESC/STRING.
+
+| Feature | dAUROC | dAUPR | Verdict |
+|---------|--------|-------|---------|
+| corr_init (A from correlation) | -0.013 | -0.003 | Harmful |
+| edge_feat (learned edge projection) | **+0.003** | -0.000 | Marginal |
+| var_embed (variational gene embeddings) | +0.001 | -0.001 | Neutral |
+| tf_mask (TF-only rows at inference) | 0.000 | 0.000 | No-op |
+| leaky_relu (LeakyReLU throughout) | +0.001 | -0.001 | Neutral |
+| arcsinh (arcsinh normalization) | -0.001 | -0.008 | Harmful |
+
+**No feature produced a meaningful improvement.** The key insight is that
+GRNFormer's ideas are tied to its supervised paradigm (BCE on known edges,
+subgraph sampling, variational graph autoencoder). These don't transfer to
+an unsupervised velocity-prediction approach where A is learned purely from
+flow matching.
+
+Two additional features (balanced_neg_sampling, ground_truth_union) could
+not be validly tested in the unsupervised setting — they only apply to the
+supervision pathway which is data leakage on BEELINE (Finding 004).
 
 ---
 
-## 7. Limitations and Future Work
+## 7. Technical Lessons
+
+| Lesson | Impact | Finding |
+|--------|--------|---------|
+| Weight decay on A must be zero | Critical — A collapses otherwise | 001 |
+| OT vs independent coupling doesn't matter | No effect on GRN quality | 002 |
+| GAT needs a_scale ~100 for A visibility | 0.534 -> 0.607 AUROC | 003 |
+| SEM residual + GAT is synergistic | 0.607 -> 0.616 AUROC | 005 |
+| Lambda_adj peak at 0.3 (GAT), 0.1 (MLP) | Higher values degrade | 005 |
+| Low-rank A factorization fails | Sparse GRNs need full rank | 006 |
+| Co-expression bias doesn't help | Correlation != regulation | 006 |
+| Supervision on eval edges = leakage | AUROC=1.0 (trivially) | 004 |
+| L1 regularization is ineffective | ~0.00003 vs ~1.5 flow loss | 001 |
+| Joint training is neutral with HVG gene sets | Near-zero gene overlap | 008 |
+| Few-shot is stable (10% ≈ 100%) but below solo | Frozen blocks constrain | 008 |
+| Supervised GRN ideas don't transfer to unsupervised | Paradigm mismatch | 009 |
+| Correlation-based A init is harmful | Biases away from regulation | 009 |
+
+---
+
+## 8. Limitations and Future Work
 
 1. **AUPR gap on STRING at scale** — baseline retains slight AUPR advantage
    on non-development datasets. May reflect DDPM vs CFM objective differences
@@ -313,3 +354,4 @@ or ortholog-based mapping.
 | 4 | Joint training | `traces/transfer/20260315_010953_CDT/` |
 | 4 | Pretrain (4 datasets) | `traces/transfer/20260315_011825_CDT/` |
 | 4 | Few-shot titration | `traces/transfer/20260315_01*_CDT/` |
+| 5 | GRNFormer ideas ablation | `traces/*_p5_*/` |

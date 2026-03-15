@@ -78,7 +78,10 @@ steps occur per epoch.
 
 ## 3. Data Normalization
 
-Expression data undergoes two-stage normalization before training:
+Expression data is normalized before training. Two modes are available,
+controlled by `data.normalization`:
+
+### Default: two-stage z-score (`normalization: "zscore"`)
 
 ```python
 # Stage 1: min-max per cell (row)
@@ -92,6 +95,21 @@ After normalization, each gene has approximately zero mean and unit variance.
 This means x_0 ~ N(0, I) and x_1 ~ normalized data have comparable scale,
 and the target velocity u_t = x_1 - x_0 has expected squared norm ~2G
 (where G is the number of genes).
+
+### Alternative: arcsinh normalization (`normalization: "arcsinh"`)
+
+Inspired by GRNFormer's preprocessing. Arcsinh is smooth at zero and handles
+zero-inflated scRNA-seq count data better than log transforms:
+
+```python
+# Stage 1: arcsinh transform (handles zero-inflation gracefully)
+normalized = arcsinh(exp_array)
+
+# Stage 2: z-score per gene (column)
+normalized = (normalized - gene_mean) / gene_std
+```
+
+Configuration: `{"data": {"normalization": "arcsinh"}}`
 
 
 ## 4. The Adjacency Matrix
@@ -116,6 +134,25 @@ class AdjacencyMatrix(nn.Module):
 
 For G=1000: `gene_reg_norm = 1/999 ≈ 0.001`, `tau ≈ 0.0005`,
 initial values ≈ 0.005.
+
+### Correlation-based initialization (`adj_init: "corr"`)
+
+Instead of uniform initialization, A can be warm-started from the gene
+co-expression correlation matrix. Absolute correlation values are scaled to
+match the default init magnitude:
+
+```python
+def init_from_corr(self, corr_matrix):
+    scaled = corr_matrix.abs() * self.gene_reg_norm * 5.0
+    scaled.fill_diagonal_(self.gene_reg_norm * 5.0)
+    self.adj_A.copy_(scaled)
+```
+
+This gives the adjacency matrix a data-informed starting point rather than
+learning structure entirely from scratch. Requires computing the Pearson
+correlation matrix from expression data.
+
+Configuration: `{"model": {"adj_init": "corr"}}`
 
 ### Soft thresholding
 
@@ -165,16 +202,36 @@ def i_minus_a(self):
     return eye - clean_a
 ```
 
-### GRN extraction
+### TF-aware masking (`tf_mask: true`)
 
-At evaluation time, the raw adjacency is extracted, normalized by
-`gene_reg_norm`, and compared against the ground-truth regulatory network:
+Real gene regulatory networks have a directional constraint: only
+transcription factors (TFs) can be source nodes. When TF masking is enabled,
+the model extracts the set of TF gene names from ground truth edges (all
+source genes are TFs by definition), maps them to gene indices, and stores a
+binary mask.
+
+At inference time, `get_adj()` zeros out all rows corresponding to non-TF
+genes, reducing the effective search space to only biologically plausible
+TF→target edges:
 
 ```python
 def get_adj(self):
     adj = self.get_masked_adj().detach().cpu().numpy() / self.gene_reg_norm
+    if self._tf_mask is not None:
+        adj = adj * self._tf_mask.numpy()[:, None]  # zero non-TF rows
     return adj.astype(np.float16)
 ```
+
+The mask is only applied at evaluation — during training, the full adjacency
+participates in the velocity field to maintain gradient flow.
+
+Configuration: `{"model": {"tf_mask": true}}`
+
+### GRN extraction
+
+At evaluation time, the raw adjacency is extracted, normalized by
+`gene_reg_norm`, optionally TF-masked, and compared against the ground-truth
+regulatory network.
 
 The magnitude |A_{gh}| represents the inferred regulatory strength from
 gene g to gene h. Higher values indicate stronger predicted regulation.
@@ -197,7 +254,66 @@ optimizer.param_groups[1]["weight_decay"] = cfg.train.wd_adj  # 0.0
 ```
 
 
-## 5. MLP Velocity Field (Phase 1)
+## 5. Gene Embeddings
+
+### Standard embedding (`variational_embed: false`)
+
+Each gene g has a learnable (D-1)-dimensional vector. The expression scalar
+x_t[:, g] is concatenated as the first feature:
+
+```python
+class GeneEmbedding(nn.Module):
+    def __init__(self, n_genes, hidden_dim):
+        self.gene_emb = nn.Parameter(torch.randn(n_genes, hidden_dim - 1))
+
+    def forward(self, x):
+        batch_emb = self.gene_emb.unsqueeze(0).expand(x.shape[0], -1, -1)
+        return torch.cat([x.unsqueeze(-1), batch_emb], dim=-1)
+```
+
+This gives each gene its own identity while preserving the expression value.
+
+### Variational embedding (`variational_embed: true`)
+
+Inspired by GRNFormer's variational framework. Instead of a point estimate,
+each gene's embedding is a distribution parameterized by `mu` and `logstd`:
+
+```python
+class VariationalGeneEmbedding(nn.Module):
+    def __init__(self, n_genes, hidden_dim):
+        emb_dim = hidden_dim - 1
+        self.mu = nn.Parameter(torch.randn(n_genes, emb_dim))
+        self.logstd = nn.Parameter(torch.zeros(n_genes, emb_dim))
+
+    def forward(self, x):
+        if self.training:
+            std = torch.exp(self.logstd.clamp(max=10.0))
+            emb = self.mu + std * torch.randn_like(std)   # reparameterization
+        else:
+            emb = self.mu                                  # deterministic at eval
+        batch_emb = emb.unsqueeze(0).expand(x.shape[0], -1, -1)
+        return torch.cat([x.unsqueeze(-1), batch_emb], dim=-1)
+```
+
+This provides:
+- **Regularization**: the KL divergence term `KL(q(z) || N(0,I))` prevents
+  overfitting of per-gene embeddings
+- **Uncertainty**: genes the model is unsure about have larger `logstd`
+- **Information bottleneck**: complements L1 sparsity on A
+
+The KL loss is weighted by `alpha_kl`:
+
+```
+L_kl = -0.5 * mean(1 + 2*logstd - mu^2 - exp(2*logstd))
+```
+
+Configuration:
+```json
+{"model": {"variational_embed": true}, "train": {"alpha_kl": 0.001}}
+```
+
+
+## 6. MLP Velocity Field (Phase 1)
 
 ### Architecture
 
@@ -215,23 +331,6 @@ h ──> einsum('bgd,gh->bhd', h, I-A) ──> h    # (I-A) mixing
 h ──> Linear(D-1, 1) ──> squeeze ──> v (B, G)
 ```
 
-### Gene embedding
-
-Each gene g has a learnable (D-1)-dimensional vector. The expression scalar
-x_t[:, g] is concatenated as the first feature:
-
-```python
-class GeneEmbedding(nn.Module):
-    def __init__(self, n_genes, hidden_dim):
-        self.gene_emb = nn.Parameter(torch.randn(n_genes, hidden_dim - 1))
-
-    def forward(self, x):
-        batch_emb = self.gene_emb.unsqueeze(0).expand(x.shape[0], -1, -1)
-        return torch.cat([x.unsqueeze(-1), batch_emb], dim=-1)
-```
-
-This gives each gene its own identity while preserving the expression value.
-
 ### Time conditioning
 
 Time is embedded via sinusoidal encoding (scaled by 1000 to match
@@ -242,9 +341,12 @@ each VelocityBlock:
 class VelocityBlock(nn.Module):
     def forward(self, x, t_emb):
         h = self.dropout(self.act(self.l1(x)))
-        h = h + self.act(self.time_mlp(t_emb)).unsqueeze(1)  # broadcast across genes
+        h = h + self.time_act(self.time_mlp(t_emb)).unsqueeze(1)  # broadcast across genes
         return self.act(self.l2(h))
 ```
+
+The activation function in VelocityBlock is controlled by `model.activation`
+(default: Tanh).
 
 ### (I - A) mixing
 
@@ -284,7 +386,7 @@ to predict velocity well without cross-gene information, the gradient on A
 becomes very small (observed: A_grad_norm ~ 0.01 early, growing to ~0.1 later).
 
 
-## 6. GAT Velocity Field (Phase 2)
+## 7. GAT Velocity Field (Phase 2)
 
 ### Motivation
 
@@ -295,14 +397,14 @@ into the attention mechanism, creating a tighter gradient coupling.
 ### Architecture
 
 ```
-x_t (B, G) ──> GeneEmbedding ──> Tanh ──> input_proj ──> h (B, G, D)
+x_t (B, G) ──> GeneEmbedding ──> activation ──> input_proj ──> h (B, G, D)
 t   (B,)   ──> SinusoidalTimeEmb ──> t_emb (B, 64)
 
 A_bias = a_scale * get_masked_adj()                    # (G, G)
 A_bias = A_bias.unsqueeze(0).unsqueeze(0)              # (1, 1, G, G)
 
-h ──> GATBlock_1(h, t_emb, A_bias) ──> h (B, G, D)
-      ──> GATBlock_2(h, t_emb, A_bias) ──> h
+h ──> GATBlock_1(h, t_emb, A_bias [, edge_feat]) ──> h (B, G, D)
+      ──> GATBlock_2(h, t_emb, A_bias [, edge_feat]) ──> h
 
 h ──> LayerNorm ──> Linear(D, 1) ──> squeeze ──> v (B, G)
 ```
@@ -310,11 +412,11 @@ h ──> LayerNorm ──> Linear(D, 1) ──> squeeze ──> v (B, G)
 ### GATBlock: attention with A bias
 
 Each GATBlock is a pre-norm Transformer block where A biases the attention
-logits. The full computation:
+logits:
 
 ```python
 class GATBlock(nn.Module):
-    def forward(self, h, t_emb, a_bias):
+    def forward(self, h, t_emb, a_bias, edge_feat=None):
         # 1. Pre-norm multi-head attention
         h_norm = self.norm1(h)
         Q, K, V = self.qkv(h_norm).chunk(3)        # each (B, G, D)
@@ -322,13 +424,14 @@ class GATBlock(nn.Module):
 
         logits = Q @ K^T / sqrt(d_head)              # (B, H, G, G)
         logits = logits + a_bias                      # A enters here
+        logits = logits + edge_proj(edge_feat)        # if edge_features enabled
         attn = dropout(softmax(logits, dim=-1))       # (B, H, G, G)
         out = attn @ V                                # (B, H, G, d_head)
         h = h + out_proj(concat_heads(out))           # residual
 
         # 2. Pre-norm FFN + time injection
         h_norm = self.norm2(h)
-        h = h + ffn(h_norm) + tanh(time_proj(t_emb)).unsqueeze(1)
+        h = h + ffn(h_norm) + time_act(time_proj(t_emb)).unsqueeze(1)
 
         return h
 ```
@@ -353,6 +456,32 @@ logit[h, g] = (q_h . k_g) / sqrt(d) + a_scale * A[g, h]
 
 After softmax, genes with large A_{g,h} receive more attention weight,
 meaning gene h's representation is more influenced by gene g's state.
+
+### Edge features (`edge_features: true`)
+
+Inspired by GRNFormer's TransformerConv which jointly uses node and edge
+features. When enabled, the co-expression correlation matrix is passed
+through a learned linear projection to produce per-head attention biases:
+
+```python
+# edge_feat: (G, G) correlation matrix
+# edge_proj: Linear(1, n_heads)
+ef_bias = edge_proj(edge_feat.unsqueeze(-1))    # (G, G, H)
+ef_bias = ef_bias.permute(2, 0, 1).unsqueeze(0) # (1, H, G, G)
+logits = logits + ef_bias
+```
+
+This differs from `corr_bias` (which adds a fixed scaled correlation to the
+logits) in that the projection is learned per attention head, allowing the
+model to learn how much and in what direction co-expression should influence
+attention at each head. When `edge_features` is enabled and a correlation
+matrix is provided, `corr_bias` mode is automatically disabled to avoid
+double-counting.
+
+Configuration: `{"model": {"edge_features": true}}`
+
+Requires a correlation matrix, which is computed automatically when this
+option is enabled.
 
 ### The a_scale parameter
 
@@ -386,7 +515,31 @@ Observed gradient magnitudes:
 - MLP: A_grad_norm ~ 0.01-0.17
 
 
-## 7. SEM-Style Residual Pathway
+## 8. Activations
+
+Two config fields control activations, each defaulting to the original choice
+in its respective context:
+
+- **`activation`** (default: `"tanh"`) — controls the time embedding MLP,
+  gene embedding output, MLP VelocityBlock layers, and the GATBlock time
+  projection. These all originally used Tanh.
+
+- **`ffn_activation`** (default: `"gelu"`) — controls the feed-forward
+  network inside GATBlock. This originally used GELU (standard for
+  Transformers). Only applies to the GAT architecture.
+
+Available choices for both: `"tanh"`, `"leaky_relu"`, `"gelu"`.
+
+GRNFormer uses LeakyReLU throughout, motivated by preserving gradient flow
+for negative co-expression patterns (repressive regulation). To replicate
+this:
+
+```json
+{"model": {"activation": "leaky_relu", "ffn_activation": "leaky_relu"}}
+```
+
+
+## 9. SEM-Style Residual Pathway
 
 ### Motivation
 
@@ -443,7 +596,7 @@ Observed: A_grad_norm increases from ~0.01 (without SEM) to ~0.15-0.6
 ```
 
 
-## 8. Auxiliary Losses on A
+## 10. Auxiliary Losses on A
 
 ### Known-Edge Supervision (`alpha_sup`)
 
@@ -490,6 +643,18 @@ the evaluation edges during training.
 
 Configuration: `{"train": {"alpha_sup": 0.1}}`  (0.0 = disabled)
 
+### Balanced negative sampling (`balanced_neg_sampling: true`)
+
+By default, negative edges are sampled uniformly at random, which may
+accidentally include known positive edges. When enabled, negative sampling
+explicitly excludes known positives from the negative pool, ensuring a clean
+1:1 positive/negative ratio. Inspired by GRNFormer's dynamic negative
+sampling strategy.
+
+Configuration: `{"train": {"balanced_neg_sampling": true}}`
+
+Only has effect when `alpha_sup > 0`.
+
 
 ### NOTEARS Acyclicity Constraint (`alpha_dag`)
 
@@ -522,7 +687,48 @@ trace above G.
 Configuration: `{"train": {"alpha_dag": 0.001}}`  (0.0 = disabled)
 
 
-## 9. Complete Loss Function
+### KL Divergence (`alpha_kl`)
+
+When variational gene embeddings are enabled, a KL divergence term
+regularizes the learned distributions toward a standard normal prior:
+
+```
+L_kl = -0.5 * mean(1 + 2*logstd - mu^2 - exp(2*logstd))
+```
+
+Configuration: `{"train": {"alpha_kl": 0.001}}`  (0.0 = disabled)
+
+Only has effect when `model.variational_embed` is true.
+
+
+## 11. Ground Truth Options
+
+### Standard (single source)
+
+By default, each experiment uses one ground truth type (`data.ground_truth`):
+STRING, ChIP-seq, or Non-ChIP.
+
+### Multi-source union (`ground_truth_union: true`)
+
+Inspired by GRNFormer's integration of multiple evidence sources. When
+enabled, edges from all three ground truth types are unioned into a single
+edge set, providing denser supervision signal:
+
+```python
+if cfg.ground_truth_union:
+    for other_gt in ["STRING", "ChIP-seq", "Non-ChIP"]:
+        _, other_edges = load_beeline(..., other_gt)
+        edge_set.update(other_edges)
+```
+
+The primary ground truth (from `data.ground_truth`) is still used for
+evaluation metrics — the union only affects which edges are available for
+supervision loss and TF mask extraction.
+
+Configuration: `{"data": {"ground_truth_union": true}}`
+
+
+## 12. Complete Loss Function
 
 The total loss combines flow matching with optional auxiliary terms:
 
@@ -531,6 +737,7 @@ L_total = L_flow                               # always
          + alpha_l1 * L_sparse                  # L1 sparsity (after delay)
          + alpha_sup * L_supervision            # known-edge BCE
          + alpha_dag * L_dag                    # NOTEARS acyclicity
+         + alpha_kl * L_kl                      # variational KL divergence
 ```
 
 where:
@@ -538,12 +745,13 @@ where:
 - `L_sparse = mean(|S_tau(A)|)`: soft-thresholded L1 (~0.00003, negligible)
 - `L_supervision`: BCE on A at known edge positions
 - `L_dag = tr(e^{A*A}) - G`: acyclicity constraint
+- `L_kl = KL(q(z) || N(0,I))`: variational embedding regularization
 
 The SEM residual (`lambda_adj`) is not a separate loss — it modifies the
 velocity prediction itself, affecting L_flow through the changed v_theta.
 
 
-## 10. Differences: MLP vs GAT
+## 13. Differences: MLP vs GAT
 
 | Aspect | MLP | GAT |
 |--------|-----|-----|
@@ -554,42 +762,70 @@ velocity prediction itself, affecting L_flow through the changed v_theta.
 | Time conditioning | Additive in VelocityBlock | Additive in FFN sublayer |
 | Residual connections | Skip-concat (re-add expression) | Standard Transformer residual |
 | Normalization | None | Pre-norm LayerNorm |
-| Activation | Tanh throughout | Tanh (embeddings), GELU (FFN) |
+| `activation` controls | Time MLP, gene emb, VelocityBlock | Time MLP, gene emb, time proj |
+| `ffn_activation` | N/A | FFN inside GATBlock |
+| Edge features | Not supported | Supported via `edge_features` |
 | Memory | O(G * D) | O(G^2) for attention |
 | Batch size | 256 | 32 (memory constrained) |
 | SEM residual | Supported (`lambda_adj`) | Supported (`lambda_adj`) |
 
-Both architectures support the SEM residual pathway and all auxiliary losses
-(supervision, NOTEARS). These are orthogonal to the architecture choice.
+Both architectures support variational gene embeddings, SEM residual,
+TF masking, correlation-based initialization, and all auxiliary losses.
+Edge features are GAT-only (requires attention logits to project into).
 
 
-## 11. Configuration Reference
+## 14. Configuration Reference
 
-All coupling and regularization parameters with defaults:
+All parameters with defaults. Parameters marked **(new)** were added in
+Phase 5 (GRNFormer-inspired). All new parameters default to preserving
+the original behavior.
 
 ```json
 {
+    "data": {
+        "dataset": "mESC",
+        "n_genes": 1000,
+        "ground_truth": "STRING",
+        "normalization": "zscore",          // (new) "zscore" or "arcsinh"
+        "ground_truth_union": false         // (new) union edges from all GT sources
+    },
     "model": {
-        "architecture": "gat",      // "mlp" or "gat"
-        "adj_mixing": "post",       // MLP only: "pre", "post", "both"
-        "lambda_adj": 0.0,          // SEM residual strength (0 = disabled)
-        "a_scale_init": 100.0,      // GAT only: initial A bias scale
-        "init_coef": 5.0,           // A initialization multiplier
-        "adj_dropout": 0.3          // dropout rate on A during training
+        "architecture": "gat",             // "mlp" or "gat"
+        "hidden_dim": 256,
+        "n_heads": 4,                      // GAT only
+        "n_layers": 2,
+        "adj_mixing": "post",              // MLP only: "pre", "post", "both"
+        "lambda_adj": 0.0,                 // SEM residual strength
+        "a_scale_init": 100.0,             // GAT only: initial A bias scale
+        "init_coef": 5.0,                  // A initialization multiplier
+        "adj_dropout": 0.3,                // dropout rate on A during training
+        "adj_mode": "full",                // "full" or "lowrank"
+        "corr_bias": false,                // fixed correlation bias in attention
+        "adj_init": "default",             // (new) "default" or "corr"
+        "edge_features": false,            // (new) GAT only: learned edge feature projection
+        "variational_embed": false,        // (new) variational gene embeddings
+        "tf_mask": false,                  // (new) TF-only rows at inference
+        "activation": "tanh",              // (new) time/emb/block activation
+        "ffn_activation": "gelu"           // (new) GAT FFN activation
     },
     "train": {
-        "wd_adj": 0.0,              // weight decay on A (must be 0)
-        "alpha_l1": 0.001,          // L1 sparsity (negligible at this scale)
-        "l1_delay": 100,            // epochs before L1 starts
-        "l1_ramp": 100,             // epochs to ramp L1 to full strength
-        "alpha_sup": 0.0,           // known-edge supervision (0 = disabled)
-        "alpha_dag": 0.0            // NOTEARS acyclicity (0 = disabled)
+        "lr": 1e-3,
+        "batch_size": 256,
+        "epochs": 500,
+        "wd_adj": 0.0,                    // weight decay on A (must be 0)
+        "alpha_l1": 0.001,                // L1 sparsity
+        "l1_delay": 100,                  // epochs before L1 starts
+        "l1_ramp": 100,                   // epochs to ramp L1 to full strength
+        "alpha_sup": 0.0,                 // known-edge supervision
+        "alpha_dag": 0.0,                 // NOTEARS acyclicity
+        "alpha_kl": 0.0,                  // (new) variational KL weight
+        "balanced_neg_sampling": false     // (new) exclude positives from negatives
     }
 }
 ```
 
 
-## 12. Transfer Learning (Multi-Dataset Training)
+## 15. Transfer Learning (Multi-Dataset Training)
 
 ### Motivation
 
@@ -676,7 +912,7 @@ class TransferConfig(BaseModel):
 ```
 
 
-## 13. What the Model Does NOT Do
+## 16. What the Model Does NOT Do
 
 - **No latent space**: the flow operates directly on gene expression vectors,
   not a learned latent representation. The `latent_dim` config field is unused.
