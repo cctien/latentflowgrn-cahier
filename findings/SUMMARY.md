@@ -290,7 +290,50 @@ supervision pathway which is data leakage on BEELINE (Finding 004).
 
 ---
 
-## 7. Technical Lessons
+## 7. Phase 6: scDFM-Inspired Improvements (Finding 010)
+
+Evaluated 4 ideas from scDFM (ICLR 2026), a distributional flow matching
+model for perturbation prediction. Tested on mESC + hESC against all three
+ground truth types.
+
+| Feature | STRING dAUROC | ChIP dAUROC | Non-ChIP dAUROC | Verdict |
+|---------|--------------|-------------|----------------|---------|
+| diff_attn | +0.000 | **+0.004** | **+0.002** | Mild positive |
+| knn_mask (k=30) | **-0.038** | +0.004 | -0.011 | Strong negative |
+| adaln_zero | -0.001 | -0.001 | -0.003 | Negative |
+| mmd_loss (α=0.5) | -0.000 | +0.000 | +0.000 | Neutral |
+
+**diff_attn is the only positive signal** — small AUROC gains on experimental
+GTs by suppressing noisy attention patterns. All other features hurt or are
+irrelevant to adjacency learning:
+
+- **knn_mask** destroyed STRING/Non-ChIP performance (EPR −61% on mESC).
+  Hard masking based on correlation prevents A from exploring the full
+  regulatory space. Reinforces the lesson from Finding 006: correlation ≠
+  regulation.
+- **adaln_zero** zero-initialized gates waste training budget warming up.
+- **mmd_loss** is orthogonal to A learning — distributional alignment
+  doesn't strengthen A's gradient signal.
+
+The core issue: scDFM's innovations target perturbation prediction (matching
+cell distributions), not GRN inference (learning a sparse adjacency). The
+bottleneck in our model is the gradient signal to A, and only diff_attn
+marginally helps by denoising attention.
+
+### TF mask re-evaluation
+
+A separate TF mask ablation (Finding 009b) revealed:
+1. The `GRNEvaluator` already filters evaluation to TF→target edges
+   regardless of our model's TF mask setting
+2. TF masking applies during training (not just inference), constraining
+   the SEM residual and attention bias — uniformly hurting performance
+3. The STRING ground truth metrics were incorrectly reported as zeros due to
+   a key naming bug in `MultiEvaluator` (bare `AUROC` vs `STRING/AUROC`),
+   now fixed
+
+---
+
+## 8. Technical Lessons
 
 | Lesson | Impact | Finding |
 |--------|--------|---------|
@@ -307,10 +350,14 @@ supervision pathway which is data leakage on BEELINE (Finding 004).
 | Few-shot is stable (10% ≈ 100%) but below solo | Frozen blocks constrain | 008 |
 | Supervised GRN ideas don't transfer to unsupervised | Paradigm mismatch | 009 |
 | Correlation-based A init is harmful | Biases away from regulation | 009 |
+| Hard correlation masking destroys A learning | Correlation ≠ regulation (again) | 010 |
+| Distributional alignment (MMD) is orthogonal to A | Velocity ≠ distribution quality | 010 |
+| Differential attention mildly helps GRN inference | Denoises attention → cleaner A gradients | 010 |
+| TF mask hurts during training, is redundant at eval | Evaluator already filters to TF edges | 010 |
 
 ---
 
-## 8. Limitations and Future Work
+## 9. Limitations and Future Work
 
 1. **AUPR gap on STRING at scale** — baseline retains slight AUPR advantage
    on non-development datasets. May reflect DDPM vs CFM objective differences
@@ -355,3 +402,5 @@ supervision pathway which is data leakage on BEELINE (Finding 004).
 | 4 | Pretrain (4 datasets) | `traces/transfer/20260315_011825_CDT/` |
 | 4 | Few-shot titration | `traces/transfer/20260315_01*_CDT/` |
 | 5 | GRNFormer ideas ablation | `traces/*_p5_*/` |
+| 6 | TF mask ablation | `traces/*_tf_mask_*/` |
+| 6 | scDFM ideas ablation | `traces/*_scdfm_*/` |
