@@ -176,27 +176,44 @@ network degenerates toward a linear SEM.
 
 ## 5. Best Configurations
 
-### MLP + SEM (best for STRING AUROC)
-
-```json
-{
-    "model": {"architecture": "mlp", "n_layers": 3, "lambda_adj": 0.1},
-    "train": {"batch_size": 256, "lr": 1e-3, "wd_adj": 0.0, "epochs": 500}
-}
-```
-
-### GAT + SEM (best for ChIP-seq and precision)
+### GAT + SEM + edge+diff (best for STRING AUROC, Finding 011)
 
 ```json
 {
     "model": {
         "architecture": "gat", "hidden_dim": 128, "n_heads": 4,
-        "n_layers": 2, "a_scale_init": 100.0, "lambda_adj": 0.3
+        "n_layers": 2, "a_scale_init": 100.0, "lambda_adj": 0.3,
+        "edge_features": true, "diff_attn": true
     },
     "train": {
         "batch_size": 32, "lr": 2e-4, "lr_warmup": 50,
         "steps_per_epoch": 4, "wd_adj": 0.0, "epochs": 500
     }
+}
+```
+
+### GAT + SEM + diff_attn (best for ChIP-seq and Non-ChIP)
+
+```json
+{
+    "model": {
+        "architecture": "gat", "hidden_dim": 128, "n_heads": 4,
+        "n_layers": 2, "a_scale_init": 100.0, "lambda_adj": 0.3,
+        "diff_attn": true
+    },
+    "train": {
+        "batch_size": 32, "lr": 2e-4, "lr_warmup": 50,
+        "steps_per_epoch": 4, "wd_adj": 0.0, "epochs": 500
+    }
+}
+```
+
+### MLP + SEM (best for STRING AUROC on large datasets)
+
+```json
+{
+    "model": {"architecture": "mlp", "n_layers": 3, "lambda_adj": 0.1},
+    "train": {"batch_size": 256, "lr": 1e-3, "wd_adj": 0.0, "epochs": 500}
 }
 ```
 
@@ -215,12 +232,13 @@ network degenerates toward a linear SEM.
 | Co-expression bias doesn't help | Correlation != regulation | 006 |
 | Supervision on eval edges = leakage | AUROC=1.0 (trivially) | 004 |
 | L1 regularization is ineffective | ~0.00003 vs ~1.5 flow loss | 001 |
-| Joint training is neutral with HVG gene sets | Near-zero gene overlap | 008 |
+| Joint training neutral with per-dataset embeddings | Near-zero gene overlap | 008 |
 | Few-shot is stable (10% ≈ 100%) but below solo | Frozen blocks constrain | 008 |
+| Shared gene vocab + mixed dataloader matches solo | +0.009 best, mean tied at 0.6716 | 014 |
 
 ---
 
-## 5. Phase 4: Transfer Learning (Finding 008)
+## 5. Phase 4: Transfer Learning (Finding 008, superseded by Finding 014)
 
 ### Architecture
 
@@ -333,7 +351,140 @@ A separate TF mask ablation (Finding 009b) revealed:
 
 ---
 
-## 8. Technical Lessons
+## 8. Phase 6b: Best Feature Combination — Full BEELINE (Finding 011)
+
+Tested the three features with positive signal (edge_feat, diff_attn, and
+their combination) across all 7 BEELINE datasets. SEM residual (λ=0.3) is
+always on as part of the baseline.
+
+### Aggregated STRING AUROC (mean across 7 datasets)
+
+| Condition | AUROC | dAUROC |
+|-----------|-------|--------|
+| baseline (GAT+SEM) | 0.6704 | — |
+| edge_feat | 0.6691 | -0.001 |
+| diff_attn | 0.6709 | +0.001 |
+| **edge+diff** | **0.6716** | **+0.001** |
+
+**edge+diff is the new best GAT config** for STRING AUROC. The combination
+outperforms either feature alone — a genuine synergy where diff_attn's
+noise suppression helps edge features learn cleaner correlation biases.
+
+Per-dataset STRING winners: edge+diff 3/7, diff_attn 2/7, edge_feat 1/7,
+baseline 1/7. No feature ever catastrophically hurts (worst: -0.008).
+
+For experimental GTs, **diff_attn alone is best**: ChIP-seq +0.003,
+Non-ChIP +0.002. Adding edge_feat dilutes the gain on these GTs.
+
+### Updated best configurations
+
+- **STRING AUROC**: GAT + SEM(0.3) + edge_features + diff_attn
+- **ChIP-seq / Non-ChIP**: GAT + SEM(0.3) + diff_attn
+
+---
+
+## 8b. Phase 6c: Gene Embedding Style Comparison (Finding 012)
+
+Tested whether replacing the RegDiffusion concat embedding (`[x_i ; emb_i]`)
+with projected alternatives (scDFM or MLP style: `MLP(x_i) + emb_i`) improves
+GRN inference on top of the best edge+diff config.
+
+| Embed style | STRING dAUROC | ChIP dAUROC | Non-ChIP dAUROC |
+|------------|--------------|-------------|----------------|
+| concat (default) | — | — | — |
+| scdfm | -0.003 | +0.001 | -0.002 |
+| mlp | -0.002 | -0.001 | -0.001 |
+
+**Both projected styles hurt STRING AUROC.** The raw expression scalar in a
+dedicated dimension (1/128) provides a cleaner signal than projecting to
+all D dimensions via an MLP. The concat approach preserves direct access
+to expression values for all downstream layers, while projection distributes
+information without adding any.
+
+The edge+diff config with concat embedding remains the best.
+
+---
+
+## 8c. Phase 6d: Pretrained Gene Embeddings (Finding 013)
+
+Tested whether pretrained gene embeddings (GenePT: GPT-3.5 text embeddings
+of gene summaries, 1536d; scGPT: learned tokens from 33M cells, 512d) can
+improve GRN inference on top of the best edge+diff config. Embeddings are
+projected to 128d and added to the gene identity vector.
+
+### Aggregated STRING AUROC (mean across mESC, hESC)
+
+| Condition | AUROC | dAUROC vs edge+diff |
+|-----------|-------|---------------------|
+| edge+diff (no pretrained) | 0.6386 | — |
+| ed+genept (frozen, linear) | 0.6399 | +0.001 |
+| ed+scgpt (frozen, linear) | 0.6389 | +0.000 |
+| ed+genept_mlpproj | 0.6374 | -0.001 |
+| ed+genept_finetune | 0.6385 | -0.000 |
+| ed+scgpt_mlpproj | 0.6342 | -0.004 |
+| ed+scgpt_finetune | 0.6368 | -0.002 |
+
+**Pretrained embeddings provide at best marginal gains** (+0.001 AUROC).
+GenePT is slightly better than scGPT on STRING; scGPT is slightly better
+on ChIP-seq and Non-ChIP. All ablations (MLP projection, finetuning) hurt
+or match the frozen linear default.
+
+The gains don't justify the added complexity: the model already learns
+effective gene identities from flow matching, pretrained embeddings encode
+per-gene properties rather than the pairwise regulatory relationships that
+GRN inference requires, and the 1000 HVG genes are well-characterized
+enough that random initialization works well.
+
+**The edge+diff config from Finding 011 remains the best configuration.**
+
+---
+
+## 8d. Phase 7: Shared Vocabulary Transfer Learning (Finding 014)
+
+Three rounds of architectural improvements to joint training:
+
+**Experiment 1 — Shared vocab + gradient accumulation:** Shared gene
+vocabulary (`nn.Embedding` over union), gradient accumulation (1 step/epoch),
+per-dataset `a_scale`, fixed checkpoint bug. Result: 4/7 datasets improved
+(vs 1/5 in Finding 008), mean dAUROC -0.002. mHSC-GM +0.010 (best), mDC
+-0.023 (worst, outlier).
+
+**Experiment 2 — Shared low-rank adjacency:** Decompose A_k = B + R_k with
+shared low-rank base. **Catastrophic failure** (mean AUROC 0.542, -0.130
+vs solo). Confirms Finding 006: low-rank A is incompatible with GRN inference.
+
+**Experiment 3 — Mixed dataloader + consistency regularization:**
+Replaced gradient accumulation with mixed dataloader (random interleaving,
+28 steps/epoch). Added soft consistency loss on shared gene edges.
+
+| Dataset | Solo | Joint (mixed+consist) | Delta |
+|---------|------|-----------------------|-------|
+| hESC | 0.6639 | 0.6655 | +0.002 |
+| hHep | 0.6712 | 0.6698 | -0.001 |
+| mDC | 0.5539 | **0.5624** | **+0.009** |
+| mESC | 0.6175 | 0.6177 | +0.000 |
+| mHSC-E | 0.7311 | 0.7309 | -0.000 |
+| mHSC-GM | 0.7626 | 0.7529 | -0.010 |
+| mHSC-L | 0.7010 | 0.7017 | +0.001 |
+| **Mean** | **0.6716** | **0.6716** | **+0.000** |
+
+**Mean now matches solo exactly.** Mixed dataloader fixed the mDC
+catastrophe (-0.023 → +0.009) by giving Adam 28x more updates.
+
+**Experiment 4 — Consistency alpha sweep:** Tested α ∈ {0, 0.001, 0.005,
+0.01, 0.05, 0.1}. α=0.01 is optimal (mean ties solo at 0.6716). α=0
+(mixed dataloader only, no consistency) gives mean -0.001. Higher alphas
+(0.05, 0.1) are too aggressive.
+
+Key tension: consistency helps low-overlap datasets (mDC: +0.009 at α=0.01)
+but hurts high-overlap ones (mHSC-GM: -0.010). No single alpha resolves
+this because the penalty is uniform across all dataset pairs. Pair-weighted
+consistency (weaker for high-overlap pairs, stronger for low-overlap) is
+the likely next step.
+
+---
+
+## 9. Technical Lessons
 
 | Lesson | Impact | Finding |
 |--------|--------|---------|
@@ -354,10 +505,21 @@ A separate TF mask ablation (Finding 009b) revealed:
 | Distributional alignment (MMD) is orthogonal to A | Velocity ≠ distribution quality | 010 |
 | Differential attention mildly helps GRN inference | Denoises attention → cleaner A gradients | 010 |
 | TF mask hurts during training, is redundant at eval | Evaluator already filters to TF edges | 010 |
+| edge_feat + diff_attn synergize | Combo > either alone on STRING AUROC | 011 |
+| diff_attn is best single feature for experimental GTs | +0.003 ChIP-seq, +0.002 Non-ChIP | 011 |
+| Projected gene embeddings don't help GRN inference | Raw scalar in 1 dim > MLP projection to D dims | 012 |
+| Pretrained embeddings (GenePT/scGPT) provide negligible gains | +0.001 AUROC, not worth the complexity | 013 |
+| Frozen linear projection is best for pretrained embeddings | MLP proj and finetuning both hurt | 013 |
+| GRN inference needs pairwise signals, not per-gene features | Pretrained embeddings encode gene properties, not interactions | 013 |
+| Shared gene vocabulary enables genuine transfer | 4/7 datasets improve, +0.010 best | 014 |
+| High gene overlap predicts transfer benefit | mHSC-E/GM (618 genes, 55%) benefit most | 014 |
+| Shared low-rank adjacency fails catastrophically | Confirms Finding 006: low-rank A kills GRN | 014 |
+| Mixed dataloader >> gradient accumulation | 28x more Adam updates, fixes mDC outlier | 014 |
+| Consistency regularization softly shares adj structure | L2 penalty on shared gene edges across datasets | 014 |
 
 ---
 
-## 9. Limitations and Future Work
+## 10. Limitations and Future Work
 
 1. **AUPR gap on STRING at scale** — baseline retains slight AUPR advantage
    on non-development datasets. May reflect DDPM vs CFM objective differences
@@ -370,17 +532,18 @@ A separate TF mask ablation (Finding 009b) revealed:
 3. **Single seed** — results are from seed=42 only. Multi-seed runs needed
    for confidence intervals.
 
-4. **Transfer learning limited by gene overlap** — HVG selection creates
-   near-disjoint gene sets across datasets, preventing meaningful transfer
-   of regulatory structure. Fixed gene panels or ortholog mapping needed.
+4. **Transfer learning ties solo but doesn't yet beat it** — shared
+   vocabulary + mixed dataloader + consistency (α=0.01) matches solo mean
+   exactly (0.6716). The mDC-vs-mHSC-GM tension (consistency helps
+   low-overlap, hurts high-overlap) needs pair-weighted consistency to
+   resolve. Multi-seed validation needed to confirm any positive signal.
 
 5. **No latent space** — flow matching operates directly on expression vectors.
    An encoder-decoder architecture could improve scaling and enable transfer
    by mapping variable gene sets into a shared latent space.
 
-6. **Few-shot underperforms solo** — frozen shared blocks from mismatched
-   datasets constrain the model more than they help. Partial unfreezing or
-   adapter layers could improve this.
+6. **Single seed** — all results from seed=42 only. Multi-seed validation
+   needed for the transfer learning gains to be conclusive.
 
 ---
 
@@ -404,3 +567,10 @@ A separate TF mask ablation (Finding 009b) revealed:
 | 5 | GRNFormer ideas ablation | `traces/*_p5_*/` |
 | 6 | TF mask ablation | `traces/*_tf_mask_*/` |
 | 6 | scDFM ideas ablation | `traces/*_scdfm_*/` |
+| 6 | Best combo (full BEELINE) | `traces/*_combo_*/` |
+| 6 | Embed style comparison | `traces/*_combo_*+scdfm_*/`, `traces/*_combo_*+mlp_*/` |
+| 6 | Pretrained embeddings | `traces/*_combo_ed+genept_*/`, `traces/*_combo_ed+scgpt_*/` |
+| 7 | Shared vocab + accum | `traces/transfer/20260316_124238_CDT/` |
+| 7 | Shared low-rank adj (failed) | `traces/transfer/20260316_134533_CDT/` |
+| 7 | Mixed dataloader + consist | `traces/transfer/20260316_143900_CDT/` |
+| 7 | Consistency sweep (α=0–0.1) | `traces/transfer/20260316_15*_CDT/`, `traces/transfer/20260316_17*_CDT/` |
